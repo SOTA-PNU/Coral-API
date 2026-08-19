@@ -1,5 +1,5 @@
 build/
-data/
+data
 models-out/
 _salvage/
 coral-npu/

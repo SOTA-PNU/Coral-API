@@ -13,6 +13,7 @@
 [0,1] 이면 그대로 쓴다. 판별은 값의 범위로 한다.
 """
 
+import os
 import json
 import sys
 from pathlib import Path
@@ -20,7 +21,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-ROOT = Path("/workspace/lowering-project")
+ROOT = Path(os.environ.get("CORAL_ROOT", "/workspace/lowering-project"))
 MEAN = np.array([0.485, 0.456, 0.406], np.float32).reshape(3, 1, 1)
 STD = np.array([0.229, 0.224, 0.225], np.float32).reshape(3, 1, 1)
 

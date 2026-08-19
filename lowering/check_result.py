@@ -26,6 +26,7 @@ YOLOv3-tiny 는 출력 172,380 개 중 대부분이 objectness 가 낮아 버려
 상태 h 는 -1~1 값 128개의 합이 -2.9) 분모가 0 에 가까워져 지표가 무너진다.
 """
 
+import os
 import json
 import re
 import sys
@@ -34,7 +35,7 @@ from pathlib import Path
 import numpy as np
 
 DEFAULT_TOL = 1e-2
-ROOT = Path("/workspace/lowering-project")
+ROOT = Path(os.environ.get("CORAL_ROOT", "/workspace/lowering-project"))
 
 # 모델별 수치 허용치. 기본값으로 판정 못 하는 것만 근거와 함께 적는다.
 #

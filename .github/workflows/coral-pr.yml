@@ -1,0 +1,94 @@
+name: coral quick + gate
+
+on:
+  pull_request:
+    # Coral-API 에는 파이프라인 말고 다른 것도 들어온다. 관련 없는 PR 에서
+    # 벤치 머신을 잡아 두지 않도록 경로로 거른다.
+    paths: ['lowering/**', '.github/workflows/coral-*.yml']
+  push:
+    branches: [main]
+    paths: ['lowering/**', '.github/workflows/coral-*.yml']
+  workflow_dispatch:
+
+# self-hosted 러너 보호: 잡에 주는 토큰은 읽기 전용으로 좁힌다.
+permissions:
+  contents: read
+
+# 러너가 한 대뿐이다. bazel 서버와 build/ 가 겹치지 않게 직렬화한다.
+concurrency:
+  group: coral-bench
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # bash 를 명시하면 -eo pipefail 이 붙는다. tee 뒤에서도 coral.sh 종료 코드가 잡힌다.
+    shell: bash
+    working-directory: lowering
+
+env:
+  CORAL_ROOT: ${{ github.workspace }}/lowering
+  CORALNPU_DIR: /workspace/coralnpu
+  IREE_BUILD_DIR: /workspace/iree-build
+  IREE_SRC_DIR: /workspace/iree
+
+jobs:
+  quick:
+    # public 레포 + self-hosted 러너: 포크에서 온 PR 은 이 머신에서 실행하지 않는다.
+    # 본 레포 브랜치에서 연 PR(조직 멤버)은 정상 실행된다.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, X64, coral]
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # data/ 122MB 는 저장소에 없다. 머신에 있는 것을 링크로 빌려 쓴다.
+      - name: 데이터셋 연결
+        run: ln -sfn /workspace/lowering-project/data "$CORAL_ROOT/data"
+
+      # 환경이 어긋나면 여기서 즉시 죽는 편이 30분 뒤 죽는 것보다 낫다.
+      - name: 환경 점검
+        run: |
+          python3 -c 'import torch, numpy; print("torch", torch.__version__, "numpy", numpy.__version__)'
+          test -x "$IREE_BUILD_DIR/tools/iree-compile"
+          test -f "$IREE_SRC_DIR/build_tools/cmake/generic_riscv32.cmake"
+          test -d "$CORAL_ROOT/data/MNIST"
+          echo "bazel output_base: $(cd "$CORALNPU_DIR" && bazel info output_base)"
+          df -h /workspace | tail -1
+
+      - name: quick (lenet5, charrnn)
+        run: ./coral.sh --quick --keep-going 2>&1 | tee quick.out
+
+      # 가중치는 같고 입력만 다른 3종. 실제 연산이 일어나는지 확인하는 회귀 게이트.
+      # --gate 는 MODELS 를 통째로 덮어쓰므로 다른 모델 인자와 섞지 않는다.
+      - name: gate (argmax 7/2/1)
+        run: ./coral.sh --gate --keep-going 2>&1 | tee gate.out
+
+      - name: 요약
+        if: always()
+        run: |
+          {
+            echo '### quick'; echo '```'
+            tail -n 25 quick.out 2>/dev/null || echo '(로그 없음)'
+            echo '```'
+            echo '### gate'; echo '```'
+            tail -n 25 gate.out 2>/dev/null || echo '(로그 없음)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # upload-artifact 의 path 는 working-directory 가 아니라 저장소 루트 기준이다.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coral-logs-${{ github.run_id }}
+          path: |
+            lowering/*.out
+            lowering/run_*.log
+            lowering/build_*.log
+            lowering/build/*/manifest.json
+          retention-days: 14
+
+      # 모델당 수십~수백 MB 다. 매 실행 뒤 치우지 않으면 디스크가 찬다.
+      - name: 정리
+        if: always()
+        run: rm -rf "$CORAL_ROOT/build"

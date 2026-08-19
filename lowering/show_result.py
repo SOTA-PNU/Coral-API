@@ -9,13 +9,14 @@
 모델별로 의미 단위까지 풀어준다.
 """
 
+import os
 import json
 import sys
 from pathlib import Path
 
 import numpy as np
 
-ROOT = Path("/workspace/lowering-project")
+ROOT = Path(os.environ.get("CORAL_ROOT", "/workspace/lowering-project"))
 SHADES = " .:-=+*#%@"
 
 COCO = ("person bicycle car motorcycle airplane bus train truck boat traffic_light "

@@ -4,13 +4,14 @@
 파이프라인에 태우기 전에 여기서 먼저 맞아야 한다. 버스 1대와 사람 여럿이
 나오면 가중치 매핑이 정확한 것이다.
 """
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-ROOT = Path("/workspace/lowering-project")
+ROOT = Path(os.environ.get("CORAL_ROOT", "/workspace/lowering-project"))
 sys.path.insert(0, str(ROOT))
 from models.darknet import DarknetModel  # noqa: E402
 

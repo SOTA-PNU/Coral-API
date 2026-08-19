@@ -22,8 +22,8 @@
 #   ⑥   check_result.py : 기준 출력과 대조해 합격/불합격 판정
 set -uo pipefail
 
-ROOT=/workspace/lowering-project
-SIM=/workspace/coralnpu
+ROOT="${CORAL_ROOT:-/workspace/lowering-project}"
+SIM="${CORALNPU_DIR:-/workspace/coralnpu}"
 DEADLINE=10800
 RUN_ONLY=0
 KEEP_GOING=0

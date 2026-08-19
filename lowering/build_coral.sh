@@ -18,12 +18,16 @@
 set -euo pipefail
 
 MODEL="${1:?usage: build_coral.sh <model>}"
-ROOT=/workspace/lowering-project
+ROOT="${CORAL_ROOT:-/workspace/lowering-project}"
 BUILD="$ROOT/build/$MODEL"
 ELF="$BUILD/elf"
 
-IREE_COMPILE=/workspace/iree-build/tools/iree-compile
-BAZEL_EXT=/home/jiho/.cache/bazel/_bazel_jiho/b46b2371731b5e359fe122b9970a16e8
+IREE_BUILD_DIR="${IREE_BUILD_DIR:-/workspace/iree-build}"
+IREE_SRC_DIR="${IREE_SRC_DIR:-/workspace/iree}"
+CORALNPU_DIR="${CORALNPU_DIR:-/workspace/coralnpu}"
+IREE_COMPILE="$IREE_BUILD_DIR/tools/iree-compile"
+# output_base 해시는 사용자명·워크스페이스 경로에서 나오므로 고정하지 않고 bazel 에 묻는다.
+BAZEL_EXT="${CORAL_BAZEL_OUTPUT_BASE:-$(cd "$CORALNPU_DIR" && bazel info output_base)}"
 CORAL_CRT="$BAZEL_EXT/execroot/coralnpu_hw/bazel-out/k8-fastbuild/bin/toolchain/crt/libcrt.lo"
 RISCV_ROOT="$BAZEL_EXT/external/toolchain_coralnpu_v2"
 
@@ -67,9 +71,10 @@ fi
 if [ ! -f "$ELF/CMakeCache.txt" ]; then
   cmake -S "$ROOT/coral_elf" -B "$ELF" -G Ninja \
     -DCMAKE_BUILD_TYPE=MinSizeRel \
-    -DCMAKE_TOOLCHAIN_FILE=/workspace/iree/build_tools/cmake/generic_riscv32.cmake \
+    -DCMAKE_TOOLCHAIN_FILE="$IREE_SRC_DIR/build_tools/cmake/generic_riscv32.cmake" \
+    -DIREE_REPO_ROOT="$IREE_SRC_DIR" \
     -DRISCV_TOOLCHAIN_ROOT="$RISCV_ROOT" \
-    -DIREE_HOST_BIN_DIR=/workspace/iree-build/tools \
+    -DIREE_HOST_BIN_DIR="$IREE_BUILD_DIR/tools" \
     -DMODEL_DIR="$BUILD" \
     -DCORAL_CRT="$CORAL_CRT" \
     -DCORAL_LINKER_SCRIPT="$ELF/coral.ld" > "$ELF/configure.log" 2>&1 \
