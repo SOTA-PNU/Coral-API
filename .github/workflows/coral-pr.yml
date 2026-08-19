@@ -56,15 +56,16 @@ jobs:
           echo "bazel output_base: $(cd "$CORALNPU_DIR" && bazel info output_base)"
           df -h /workspace | tail -1
 
-      - name: [HUD] 대시보드 Run 시작
+      - name: "[HUD] 대시보드 Run 시작"
         run: |
           pip3 install requests --quiet || true
           COMMIT_HASH="${{ github.event.pull_request.head.sha || github.sha }}"
-          RES=$(python3 -c "import requests; print(requests.post('https://sota.pusan.ac.kr/cicd/api/runs/start', json={'commit_hash': '$COMMIT_HASH'}).json()['id'])")
+          REPO_NAME="${{ github.repository }}"
+          RES=$(python3 -c "import requests; print(requests.post('https://sota.pusan.ac.kr/cicd/api/runs/start', json={'commit_hash': '$COMMIT_HASH', 'repo_name': '$REPO_NAME'}).json()['id'])")
           echo "RUN_ID=$RES" >> $GITHUB_ENV
-          python3 -c "import requests; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+str('$RES')+'/log', json={'log': '--- Starting Coral NPU CI Pipeline ---'})"
+          python3 -c "import requests; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+str('$RES')+'/log', json={'log': '--- Starting Coral NPU CI Pipeline ('+ '$REPO_NAME' +') ---'})"
 
-      - name: [HUD] Correctness 상태 업데이트 (Running)
+      - name: "[HUD] Correctness 상태 업데이트 (Running)"
         run: |
           python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/job/correctness/npu', json={'status': 'running'})"
           python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/log', json={'log': '[Job: Correctness] [NPU] Running quick (lenet5, charrnn)...'})"
@@ -72,13 +73,13 @@ jobs:
       - name: quick (lenet5, charrnn)
         run: ./coral.sh --quick --keep-going 2>&1 | tee quick.out
 
-      - name: [HUD] Correctness 상태 업데이트 (Done)
+      - name: "[HUD] Correctness 상태 업데이트 (Done)"
         if: always()
         run: |
           STATUS="${{ job.status == 'success' && 'success' || 'failure' }}"
           python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/job/correctness/npu', json={'status': '$STATUS'})"
 
-      - name: [HUD] Benchmark 상태 업데이트 (Running)
+      - name: "[HUD] Benchmark 상태 업데이트 (Running)"
         if: always()
         run: |
           python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/job/benchmark/npu', json={'status': 'running'})"
@@ -89,7 +90,7 @@ jobs:
       - name: gate (argmax 7/2/1)
         run: ./coral.sh --gate --keep-going 2>&1 | tee gate.out
 
-      - name: [HUD] Benchmark 상태 업데이트 (Done)
+      - name: "[HUD] Benchmark 상태 업데이트 (Done)"
         if: always()
         run: |
           STATUS="${{ job.status == 'success' && 'success' || 'failure' }}"
@@ -124,7 +125,7 @@ jobs:
         if: always()
         run: rm -rf "$CORAL_ROOT/build"
 
-      - name: [HUD] 대시보드 Run 종료
+      - name: "[HUD] 대시보드 Run 종료"
         if: always()
         run: |
           OVERALL_STATUS="${{ job.status == 'success' && 'success' || 'failure' }}"
