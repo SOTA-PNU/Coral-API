@@ -1,0 +1,15 @@
+build/
+data/
+models-out/
+_salvage/
+coral-npu/
+iree/
+__pycache__/
+*.pyc
+
+# 실행 흔적 — CI 는 아티팩트로 올리므로 저장소에 둘 이유가 없다
+build_*.log
+run_*.log
+sim_run.log
+*.mlirbc
+*.vmfb
