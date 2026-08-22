@@ -56,34 +56,46 @@ jobs:
           echo "bazel output_base: $(cd "$CORALNPU_DIR" && bazel info output_base)"
           df -h /workspace | tail -1
 
+      # HUD 는 관측용이다. 대시보드가 죽어 있어도(502 등) CI 본체는 돌아야
+      # 하므로 모든 HUD 스텝은 continue-on-error 로 두고, 시작이 실패해
+      # RUN_ID 가 없으면 이후 스텝은 조용히 건너뛴다.
       - name: "[HUD] 대시보드 Run 시작"
+        continue-on-error: true
+        env:
+          COMMIT_HASH: ${{ github.event.pull_request.head.sha || github.sha }}
+          REPO_NAME: ${{ github.repository }}
         run: |
           pip3 install requests --quiet || true
-          COMMIT_HASH="${{ github.event.pull_request.head.sha || github.sha }}"
-          REPO_NAME="${{ github.repository }}"
-          RES=$(python3 -c "import requests; print(requests.post('https://sota.pusan.ac.kr/cicd/api/runs/start', json={'commit_hash': '$COMMIT_HASH', 'repo_name': '$REPO_NAME'}).json()['id'])")
-          echo "RUN_ID=$RES" >> $GITHUB_ENV
-          python3 -c "import requests; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+str('$RES')+'/log', json={'log': '--- Starting Coral NPU CI Pipeline ('+ '$REPO_NAME' +') ---'})"
+          RES=$(python3 -c "import requests, os; print(requests.post('https://sota.pusan.ac.kr/cicd/api/runs/start', json={'commit_hash': os.environ['COMMIT_HASH'], 'repo_name': os.environ['REPO_NAME']}, timeout=10).json()['id'])")
+          echo "RUN_ID=$RES" >> "$GITHUB_ENV"
+          export RUN_ID="$RES"
+          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/log', json={'log': '--- Starting Coral NPU CI Pipeline ('+os.environ['REPO_NAME']+') ---'}, timeout=10)"
 
       - name: "[HUD] Correctness 상태 업데이트 (Running)"
+        continue-on-error: true
         run: |
-          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/job/correctness/npu', json={'status': 'running'})"
-          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/log', json={'log': '[Job: Correctness] [NPU] Running quick (lenet5, charrnn)...'})"
+          [ -n "${RUN_ID:-}" ] || { echo 'RUN_ID 없음 — HUD 생략'; exit 0; }
+          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/job/correctness/npu', json={'status': 'running'}, timeout=10)"
+          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/log', json={'log': '[Job: Correctness] [NPU] Running quick (lenet5, charrnn)...'}, timeout=10)"
 
       - name: quick (lenet5, charrnn)
         run: ./coral.sh --quick --keep-going 2>&1 | tee quick.out
 
       - name: "[HUD] Correctness 상태 업데이트 (Done)"
         if: always()
+        continue-on-error: true
         run: |
+          [ -n "${RUN_ID:-}" ] || { echo 'RUN_ID 없음 — HUD 생략'; exit 0; }
           STATUS="${{ job.status == 'success' && 'success' || 'failure' }}"
-          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/job/correctness/npu', json={'status': '$STATUS'})"
+          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/job/correctness/npu', json={'status': '$STATUS'}, timeout=10)"
 
       - name: "[HUD] Benchmark 상태 업데이트 (Running)"
         if: always()
+        continue-on-error: true
         run: |
-          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/job/benchmark/npu', json={'status': 'running'})"
-          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/log', json={'log': '[Job: Benchmark] [NPU] Running gate (argmax 7/2/1)...'})"
+          [ -n "${RUN_ID:-}" ] || { echo 'RUN_ID 없음 — HUD 생략'; exit 0; }
+          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/job/benchmark/npu', json={'status': 'running'}, timeout=10)"
+          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/log', json={'log': '[Job: Benchmark] [NPU] Running gate (argmax 7/2/1)...'}, timeout=10)"
 
       # 가중치는 같고 입력만 다른 3종. 실제 연산이 일어나는지 확인하는 회귀 게이트.
       # --gate 는 MODELS 를 통째로 덮어쓰므로 다른 모델 인자와 섞지 않는다.
@@ -92,9 +104,11 @@ jobs:
 
       - name: "[HUD] Benchmark 상태 업데이트 (Done)"
         if: always()
+        continue-on-error: true
         run: |
+          [ -n "${RUN_ID:-}" ] || { echo 'RUN_ID 없음 — HUD 생략'; exit 0; }
           STATUS="${{ job.status == 'success' && 'success' || 'failure' }}"
-          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/job/benchmark/npu', json={'status': '$STATUS'})"
+          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/job/benchmark/npu', json={'status': '$STATUS'}, timeout=10)"
 
       - name: 요약
         if: always()
@@ -127,7 +141,9 @@ jobs:
 
       - name: "[HUD] 대시보드 Run 종료"
         if: always()
+        continue-on-error: true
         run: |
+          [ -n "${RUN_ID:-}" ] || { echo 'RUN_ID 없음 — HUD 생략'; exit 0; }
           OVERALL_STATUS="${{ job.status == 'success' && 'success' || 'failure' }}"
-          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/log', json={'log': '--- CI Pipeline Finished ('+ '$OVERALL_STATUS' +') ---'})"
-          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/finish', json={'status': '$OVERALL_STATUS'})"
+          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/log', json={'log': '--- CI Pipeline Finished ('+ '$OVERALL_STATUS' +') ---'}, timeout=10)"
+          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/finish', json={'status': '$OVERALL_STATUS'}, timeout=10)"
