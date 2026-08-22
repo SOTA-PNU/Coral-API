@@ -11,7 +11,10 @@
 
 import os
 import json
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -155,7 +158,47 @@ def ascii_art(img, w=28, invert=False):
     return rows, rgb
 
 
+def _to_image(img):
+    """정규화로 틀어진 텐서를 0~255 PIL 이미지로. PIL 이 없으면 None."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    a = np.squeeze(np.asarray(img, np.float32))
+    a = (a - a.min()) / (a.max() - a.min() + 1e-9)
+    if a.ndim == 3 and a.shape[0] == 3:
+        a = a.transpose(1, 2, 0)
+    return Image.fromarray((a * 255).astype(np.uint8))
+
+
+def chafa_art(img, w):
+    """chafa(유니코드 모자이크 + 트루컬러 전경/배경)로 렌더링한 ANSI 라인들.
+
+    chafa·PIL 이 없거나 색이 꺼져 있으면 None — 호출자는 ascii_art 로
+    폴백한다. chafa 는 배경색이 그림을 만들어서 색을 지우면 그림도
+    사라지므로, 색 없는 환경에서는 문자 명암 쪽이 낫다.
+    """
+    if not COLOR or shutil.which("chafa") is None:
+        return None
+    im = img if hasattr(img, "save") else _to_image(img)
+    if im is None:
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".png") as f:
+        im.save(f.name)
+        r = subprocess.run(["chafa", "-f", "symbols", "-c", "full",
+                            "-s", f"{w}x{w}", f.name],
+                           capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return r.stdout.rstrip("\n").split("\n")
+
+
 def print_art(img, w=28):
+    art = chafa_art(img, w)
+    if art:
+        for line in art:
+            print("    " + line)
+        return
     rows, rgb = ascii_art(img, w=w)
     for i, row in enumerate(rows):
         print("    " + paint(row, rgb[i] if rgb is not None else None))
@@ -336,30 +379,45 @@ def show_yolo_real(model, man, ins, outs):
     print(f"  입력: bus.jpg {W0}x{H0} -> letterbox {size}x{size} "
           f"(다크넷 전처리)")
 
-    # 아스키 위에 박스를 겹쳐 그린다. 좌표는 원본 기준이라 격자로 환산한다.
+    # 탐지 박스는 이미지에 직접 노랑으로 그려 chafa 로 보낸다. 좌표는
+    # 원본 기준이라 letterbox 로 환산한다. chafa 폴백은 문자 격자에 겹쳐 그린다.
     AW, AH = 56, 30
-    rows, rgb = ascii_art(ins[0][0], w=AW)
-    rows = [list(r) for r in rows]
-    ah = len(rows)
-    aw = len(rows[0]) if ah else 0
-    for _, ci, x0, y0, bw, bh in dets:
-        # 원본 좌표 -> letterbox 좌표 -> 아스키 격자
-        gx0 = int((x0 * sc + ox) / size * aw)
-        gx1 = int(((x0 + bw) * sc + ox) / size * aw)
-        gy0 = int((y0 * sc + oy) / size * ah)
-        gy1 = int(((y0 + bh) * sc + oy) / size * ah)
-        gx0, gx1 = max(0, min(aw - 1, gx0)), max(0, min(aw - 1, gx1))
-        gy0, gy1 = max(0, min(ah - 1, gy0)), max(0, min(ah - 1, gy1))
-        for x in range(gx0, gx1 + 1):
-            rows[gy0][x] = "─"
-            rows[gy1][x] = "─"
-        for y in range(gy0, gy1 + 1):
-            rows[y][gx0] = "│"
-            rows[y][gx1] = "│"
-        rows[gy0][gx0] = "┌"; rows[gy0][gx1] = "┐"
-        rows[gy1][gx0] = "└"; rows[gy1][gx1] = "┘"
-    for i, r in enumerate(rows):
-        print("    " + paint("".join(r), rgb[i]))
+    art = None
+    im = _to_image(ins[0][0])
+    if im is not None:
+        from PIL import ImageDraw
+        dr = ImageDraw.Draw(im)
+        for _, ci, x0, y0, bw, bh in dets:
+            dr.rectangle([x0 * sc + ox, y0 * sc + oy,
+                          (x0 + bw) * sc + ox, (y0 + bh) * sc + oy],
+                         outline=(255, 255, 0), width=max(2, size // 200))
+        art = chafa_art(im, AW)
+    if art:
+        for line in art:
+            print("    " + line)
+    else:
+        rows, rgb = ascii_art(ins[0][0], w=AW)
+        rows = [list(r) for r in rows]
+        ah = len(rows)
+        aw = len(rows[0]) if ah else 0
+        for _, ci, x0, y0, bw, bh in dets:
+            # 원본 좌표 -> letterbox 좌표 -> 아스키 격자
+            gx0 = int((x0 * sc + ox) / size * aw)
+            gx1 = int(((x0 + bw) * sc + ox) / size * aw)
+            gy0 = int((y0 * sc + oy) / size * ah)
+            gy1 = int(((y0 + bh) * sc + oy) / size * ah)
+            gx0, gx1 = max(0, min(aw - 1, gx0)), max(0, min(aw - 1, gx1))
+            gy0, gy1 = max(0, min(ah - 1, gy0)), max(0, min(ah - 1, gy1))
+            for x in range(gx0, gx1 + 1):
+                rows[gy0][x] = "─"
+                rows[gy1][x] = "─"
+            for y in range(gy0, gy1 + 1):
+                rows[y][gx0] = "│"
+                rows[y][gx1] = "│"
+            rows[gy0][gx0] = "┌"; rows[gy0][gx1] = "┐"
+            rows[gy1][gx0] = "└"; rows[gy1][gx1] = "┘"
+        for i, r in enumerate(rows):
+            print("    " + paint("".join(r), rgb[i]))
 
     print(f"\n  탐지 {len(dets)}건 (objectness x class, NMS 적용)")
     for scr, ci, x0, y0, bw, bh in dets:
