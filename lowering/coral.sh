@@ -24,6 +24,10 @@ set -uo pipefail
 
 ROOT="${CORAL_ROOT:-/workspace/lowering-project}"
 SIM="${CORALNPU_DIR:-/workspace/coralnpu}"
+
+# show_result.py 는 sed 파이프 뒤라 isatty 가 꺼진다. 터미널에서 직접 돌릴
+# 때는 색을 강제로 켠다. (CI 는 GITHUB_ACTIONS 변수로 스스로 켠다)
+[ -t 1 ] && export CLICOLOR_FORCE=1
 DEADLINE=10800
 RUN_ONLY=0
 KEEP_GOING=0

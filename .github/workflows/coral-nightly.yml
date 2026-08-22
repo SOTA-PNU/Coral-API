@@ -59,8 +59,9 @@ jobs:
       - name: 요약
         if: always()
         run: |
+          # 로그 뷰어와 달리 summary 는 마크다운이라 ANSI 색 코드를 벗겨낸다.
           { echo '### real'; echo '```'
-            tail -n 60 real.out 2>/dev/null || echo '(로그 없음)'
+            tail -n 60 real.out 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || echo '(로그 없음)'
             echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4

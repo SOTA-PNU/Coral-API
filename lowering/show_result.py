@@ -18,6 +18,48 @@ import numpy as np
 
 ROOT = Path(os.environ.get("CORAL_ROOT", "/workspace/lowering-project"))
 SHADES = " .:-=+*#%@"
+BOXES = "─│┌┐└┘"
+
+
+def _color_on():
+    """아스키 아트에 ANSI 색을 쓸지.
+
+    coral.sh 가 sed 로 들여쓰기를 붙이며 파이프를 거치므로 isatty 만으로는
+    안 되고, CI(GITHUB_ACTIONS 로그 뷰어는 256색을 렌더링한다)와 강제
+    플래그를 함께 본다. NO_COLOR 는 관례대로 최우선.
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    if any(os.environ.get(k) for k in ("FORCE_COLOR", "CLICOLOR_FORCE",
+                                       "GITHUB_ACTIONS")):
+        return True
+    return sys.stdout.isatty()
+
+
+COLOR = _color_on()
+
+
+def paint(row):
+    """명암 문자 한 줄에 256색 그레이스케일(232~255)을 입힌다.
+
+    문자 자체는 그대로 두어 색을 지운 로그(real.out 를 grep 하는 경우 등)
+    에서도 그림이 읽히게 한다. 탐지 박스 문자는 명암과 구분되게 노랑.
+    """
+    if not COLOR:
+        return row
+    out, cur = [], None
+    for ch in row:
+        if ch in BOXES:
+            code = 226
+        else:
+            i = max(0, SHADES.find(ch))
+            code = 232 + round(i / (len(SHADES) - 1) * 23)
+        if code != cur:
+            out.append(f"\033[38;5;{code}m")
+            cur = code
+        out.append(ch)
+    out.append("\033[0m")
+    return "".join(out)
 
 COCO = ("person bicycle car motorcycle airplane bus train truck boat traffic_light "
         "fire_hydrant stop_sign parking_meter bench bird cat dog horse sheep cow "
@@ -140,7 +182,7 @@ def show_lenet5(model, man, ins, outs):
     img = ins[0][0, 0]
     print("  입력: MNIST 손글씨 28x28 (실제 테스트 이미지)")
     for row in ascii_art(img):
-        print("    " + row)
+        print("    " + paint(row))
     logits = outs[0][0]
     print("\n  추론 결과")
     order, lines, margin = score_rows(logits, lambda r: f"숫자 {r}", k=4)
@@ -176,7 +218,7 @@ def show_vgg(model, man, ins, outs):
     img = ins[0][0]
     print(f"  입력: {identify_photo(img)}  -> {img.shape[1]}x{img.shape[2]}")
     for row in ascii_art(img.mean(axis=0), w=32):
-        print("    " + row)
+        print("    " + paint(row))
     feat = outs[0][0].reshape(outs[0].shape[1], -1).mean(axis=1)
     order = np.argsort(-feat)
     nz = int((feat > 0).sum())
@@ -193,7 +235,7 @@ def show_yolo(model, man, ins, outs):
     img = ins[0][0]
     print(f"  입력: {identify_photo(img)}  -> {img.shape[1]}x{img.shape[2]}")
     for row in ascii_art(img.mean(axis=0), w=36):
-        print("    " + row)
+        print("    " + paint(row))
     print(f"\n  추론 결과: 2개 스케일의 탐지 맵 "
           f"(NMS 는 모델 밖이라 원시 예측을 그대로 해석)")
     dets = []
@@ -237,7 +279,7 @@ def show_resnet(model, man, ins, outs):
     img = ins[0][0]
     print(f"  입력: 실제 사진 {src}  ({img.shape[1]}x{img.shape[2]}, ImageNet 정규화)")
     for row in ascii_art(img.mean(axis=0), w=44):
-        print("    " + row)
+        print("    " + paint(row))
     logits = outs[0][0]
     print("\n  추론 결과 (ImageNet 1000 클래스)")
     order, lines, margin = score_rows(logits, lambda r: cats[r][:22])
@@ -295,7 +337,7 @@ def show_yolo_real(model, man, ins, outs):
         rows[gy0][gx0] = "┌"; rows[gy0][gx1] = "┐"
         rows[gy1][gx0] = "└"; rows[gy1][gx1] = "┘"
     for r in rows:
-        print("    " + "".join(r))
+        print("    " + paint("".join(r)))
 
     print(f"\n  탐지 {len(dets)}건 (objectness x class, NMS 적용)")
     for scr, ci, x0, y0, bw, bh in dets:
@@ -317,7 +359,7 @@ def show_cifar100(model, man, ins, outs):
           + (f"  정답 = {truth}" if truth else "")
           + f"   ({img.shape[1]}x{img.shape[2]})")
     for row in ascii_art(img.mean(axis=0), w=32):
-        print("    " + row)
+        print("    " + paint(row))
     logits = outs[0][0]
     print("\n  추론 결과 (CIFAR-100 100 클래스)")
     order, lines, margin = score_rows(logits, lambda r: cls[r])
