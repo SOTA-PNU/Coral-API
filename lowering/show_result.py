@@ -39,24 +39,29 @@ def _color_on():
 COLOR = _color_on()
 
 
-def paint(row):
-    """명암 문자 한 줄에 256색 그레이스케일(232~255)을 입힌다.
+def paint(row, rgb=None):
+    """명암 문자 한 줄에 색을 입힌다.
 
-    문자 자체는 그대로 두어 색을 지운 로그(real.out 를 grep 하는 경우 등)
-    에서도 그림이 읽히게 한다. 탐지 박스 문자는 명암과 구분되게 노랑.
+    rgb([w,3] 0~255)가 있으면 픽셀 원색을 24bit 트루컬러 전경색으로,
+    없으면(흑백 이미지) 256색 그레이스케일(232~255)로. 문자 자체는
+    그대로 두어 색을 지운 로그(real.out 를 grep 하는 경우 등)에서도
+    그림이 읽히게 한다. 탐지 박스 문자는 이미지와 구분되게 노랑.
     """
     if not COLOR:
         return row
     out, cur = [], None
-    for ch in row:
+    for x, ch in enumerate(row):
         if ch in BOXES:
-            code = 226
+            esc = "\033[38;5;226m"
+        elif rgb is not None:
+            r, g, b = rgb[x]
+            esc = f"\033[38;2;{r};{g};{b}m"
         else:
             i = max(0, SHADES.find(ch))
-            code = 232 + round(i / (len(SHADES) - 1) * 23)
-        if code != cur:
-            out.append(f"\033[38;5;{code}m")
-            cur = code
+            esc = f"\033[38;5;{232 + round(i / (len(SHADES) - 1) * 23)}m"
+        if esc != cur:
+            out.append(esc)
+            cur = esc
         out.append(ch)
     out.append("\033[0m")
     return "".join(out)
@@ -119,20 +124,39 @@ def softmax(x):
 
 
 def ascii_art(img, w=28, invert=False):
-    """[H,W] 실수 배열을 아스키 명암으로."""
+    """[H,W] 흑백 또는 [3,H,W] 컬러 배열을 아스키 명암으로.
+
+    (rows, rgb) 를 돌려준다. rgb 는 문자 격자와 같은 [h,w,3] 0~255 배열로
+    paint() 가 트루컬러에 쓰고, 흑백 입력이면 None 이다. 정규화(imagenet
+    등)로 틀어진 값 범위는 전체 min/max 로 되돌려 근사한다.
+    """
     a = np.asarray(img, dtype=np.float32)
     lo, hi = float(a.min()), float(a.max())
     a = (a - lo) / (hi - lo + 1e-9)
     if invert:
         a = 1.0 - a
-    h_step = max(1, a.shape[0] // 28)
-    w_step = max(1, a.shape[1] // w)
-    a = a[::h_step, ::w_step]
+    rgb = None
+    if a.ndim == 3:                        # [3,H,W]
+        h_step = max(1, a.shape[1] // 28)
+        w_step = max(1, a.shape[2] // w)
+        a = a[:, ::h_step, ::w_step]
+        rgb = np.clip(a.transpose(1, 2, 0) * 255, 0, 255).astype(int)
+        a = a.mean(axis=0)                 # 명암 문자용 휘도
+    else:
+        h_step = max(1, a.shape[0] // 28)
+        w_step = max(1, a.shape[1] // w)
+        a = a[::h_step, ::w_step]
     rows = []
     for r in a:
         rows.append("".join(SHADES[min(len(SHADES) - 1, int(v * len(SHADES)))]
                             for v in r))
-    return rows
+    return rows, rgb
+
+
+def print_art(img, w=28):
+    rows, rgb = ascii_art(img, w=w)
+    for i, row in enumerate(rows):
+        print("    " + paint(row, rgb[i] if rgb is not None else None))
 
 
 
@@ -181,8 +205,7 @@ def load(model):
 def show_lenet5(model, man, ins, outs):
     img = ins[0][0, 0]
     print("  입력: MNIST 손글씨 28x28 (실제 테스트 이미지)")
-    for row in ascii_art(img):
-        print("    " + paint(row))
+    print_art(img)
     logits = outs[0][0]
     print("\n  추론 결과")
     order, lines, margin = score_rows(logits, lambda r: f"숫자 {r}", k=4)
@@ -217,8 +240,7 @@ def show_charrnn(model, man, ins, outs):
 def show_vgg(model, man, ins, outs):
     img = ins[0][0]
     print(f"  입력: {identify_photo(img)}  -> {img.shape[1]}x{img.shape[2]}")
-    for row in ascii_art(img.mean(axis=0), w=32):
-        print("    " + paint(row))
+    print_art(img, w=32)
     feat = outs[0][0].reshape(outs[0].shape[1], -1).mean(axis=1)
     order = np.argsort(-feat)
     nz = int((feat > 0).sum())
@@ -234,8 +256,7 @@ def show_vgg(model, man, ins, outs):
 def show_yolo(model, man, ins, outs):
     img = ins[0][0]
     print(f"  입력: {identify_photo(img)}  -> {img.shape[1]}x{img.shape[2]}")
-    for row in ascii_art(img.mean(axis=0), w=36):
-        print("    " + paint(row))
+    print_art(img, w=36)
     print(f"\n  추론 결과: 2개 스케일의 탐지 맵 "
           f"(NMS 는 모델 밖이라 원시 예측을 그대로 해석)")
     dets = []
@@ -278,8 +299,7 @@ def show_resnet(model, man, ins, outs):
     src = paths[0].name if paths else "?"
     img = ins[0][0]
     print(f"  입력: 실제 사진 {src}  ({img.shape[1]}x{img.shape[2]}, ImageNet 정규화)")
-    for row in ascii_art(img.mean(axis=0), w=44):
-        print("    " + paint(row))
+    print_art(img, w=44)
     logits = outs[0][0]
     print("\n  추론 결과 (ImageNet 1000 클래스)")
     order, lines, margin = score_rows(logits, lambda r: cats[r][:22])
@@ -316,8 +336,8 @@ def show_yolo_real(model, man, ins, outs):
 
     # 아스키 위에 박스를 겹쳐 그린다. 좌표는 원본 기준이라 격자로 환산한다.
     AW, AH = 56, 30
-    img = ins[0][0].mean(axis=0)
-    rows = [list(r) for r in ascii_art(img, w=AW)]
+    rows, rgb = ascii_art(ins[0][0], w=AW)
+    rows = [list(r) for r in rows]
     ah = len(rows)
     aw = len(rows[0]) if ah else 0
     for _, ci, x0, y0, bw, bh in dets:
@@ -336,8 +356,8 @@ def show_yolo_real(model, man, ins, outs):
             rows[y][gx1] = "│"
         rows[gy0][gx0] = "┌"; rows[gy0][gx1] = "┐"
         rows[gy1][gx0] = "└"; rows[gy1][gx1] = "┘"
-    for r in rows:
-        print("    " + paint("".join(r)))
+    for i, r in enumerate(rows):
+        print("    " + paint("".join(r), rgb[i]))
 
     print(f"\n  탐지 {len(dets)}건 (objectness x class, NMS 적용)")
     for scr, ci, x0, y0, bw, bh in dets:
@@ -358,8 +378,7 @@ def show_cifar100(model, man, ins, outs):
     print(f"  입력: CIFAR-100 test[{idx}]"
           + (f"  정답 = {truth}" if truth else "")
           + f"   ({img.shape[1]}x{img.shape[2]})")
-    for row in ascii_art(img.mean(axis=0), w=32):
-        print("    " + paint(row))
+    print_art(img, w=32)
     logits = outs[0][0]
     print("\n  추론 결과 (CIFAR-100 100 클래스)")
     order, lines, margin = score_rows(logits, lambda r: cls[r])
