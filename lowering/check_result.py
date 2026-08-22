@@ -135,6 +135,9 @@ def main():
 
     bdir = ROOT / "build" / model
     manifest = json.loads((bdir / "manifest.json").read_text())
+    # 실험 변종(예: charrnn_zvl128)은 manifest 의 기본 모델명으로 허용치와
+    # 분류기/탐지기 규칙을 물려받는다. 기본 모델은 이름이 같아 동작 불변.
+    base = manifest.get("model", model)
 
     stage = grab(log, "inference_stage")
     code = grab(log, "inference_status_code")
@@ -155,7 +158,7 @@ def main():
         return 1
 
     chips, refs = load_outputs(model, manifest)
-    tol = MODEL_TOL.get(model, DEFAULT_TOL)
+    tol = MODEL_TOL.get(base, DEFAULT_TOL)
 
     # --- 수치 (참고) ---
     num_lines, num_ok = [], True
@@ -169,10 +172,10 @@ def main():
                          f"{'  초과' if over else ''}")
 
     # --- 의미 (판정) ---
-    if model in CLASSIFIERS:
+    if base in CLASSIFIERS:
         sem_ok, sem_lines = check_classifier(model, chips, refs)
         task = "분류: top-1 일치"
-    elif model in DETECTORS:
+    elif base in DETECTORS:
         sem_ok, sem_lines = check_detector(model, chips, refs)
         task = "탐지: 목록/클래스/IoU 일치"
     else:
