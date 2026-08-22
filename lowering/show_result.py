@@ -136,6 +136,8 @@ def ascii_art(img, w=28, invert=False):
     if invert:
         a = 1.0 - a
     rgb = None
+    if a.ndim == 3 and a.shape[0] == 1:    # [1,H,W] 단일 채널은 흑백으로
+        a = a[0]
     if a.ndim == 3:                        # [3,H,W]
         h_step = max(1, a.shape[1] // 28)
         w_step = max(1, a.shape[2] // w)
