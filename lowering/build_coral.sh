@@ -22,6 +22,11 @@ ROOT="${CORAL_ROOT:-/workspace/lowering-project}"
 BUILD="$ROOT/build/$MODEL"
 ELF="$BUILD/elf"
 
+# 실험 노브: CPU 피처를 바꿔 벡터화 효과를 잰다. 기본값은 기존과 동일(스칼라).
+#   CORAL_CPU_FEATURES="+m,+f,+zicsr,+zmmul,+zve32x,+zvl128b" ./build_coral.sh <model>
+# 주의: v2 시뮬레이터의 RVV 는 VLEN=128 (vlenb=16) 이다. +zvl256b 를 주면 LLVM 이
+# VLMAX=8 을 가정한 코드를 내고 시뮬레이터는 vl 을 4 로 잘라 결과가 조용히 깨진다.
+CORAL_CPU_FEATURES="${CORAL_CPU_FEATURES:-+m,+f,+zicsr,+zmmul}"
 IREE_BUILD_DIR="${IREE_BUILD_DIR:-/workspace/iree-build}"
 IREE_SRC_DIR="${IREE_SRC_DIR:-/workspace/iree}"
 CORALNPU_DIR="${CORALNPU_DIR:-/workspace/coralnpu}"
@@ -42,10 +47,7 @@ echo "=== [3] iree-compile ($MODEL) -> VMFB + 커널 ==="
     --iree-llvmcpu-target-triple=riscv32-unknown-elf \
     --iree-llvmcpu-target-cpu=generic-rv32 \
     --iree-llvmcpu-target-abi=ilp32 \
-    # --iree-llvmcpu-target-cpu-features=+m,+f,+zicsr,+zmmul,+zve32x,+a,+d,+c,+v,+zvl512b,+rv64gc \
-    --iree-llvmcpu-target-cpu-features=+m,+f,+zicsr,+zmmul,+zve32x,+zvl128b\
-    --iree-opt-data-tiling \
-    --iree-global-opt-use-im2col-for-convs=true \
+    --iree-llvmcpu-target-cpu-features="$CORAL_CPU_FEATURES" \
     --iree-llvmcpu-link-embedded=false \
     --iree-llvmcpu-link-static \
     --iree-llvmcpu-static-library-output-path=model.o \
