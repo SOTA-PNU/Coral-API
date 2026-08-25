@@ -66,10 +66,22 @@ jobs:
           REPO_NAME: ${{ github.repository }}
         run: |
           pip3 install requests --quiet || true
-          RES=$(python3 -c "import requests, os; print(requests.post('https://sota.pusan.ac.kr/cicd/api/runs/start', json={'commit_hash': os.environ['COMMIT_HASH'], 'repo_name': os.environ['REPO_NAME']}, timeout=10).json()['id'])")
+          # 서버가 죽어 있으면(502 등) 트레이스백 없이 RUN_ID 를 비워 두고 넘어간다.
+          RES=$(python3 - <<'PY'
+          import os, requests
+          try:
+              r = requests.post("https://sota.pusan.ac.kr/cicd/api/runs/start",
+                                json={"commit_hash": os.environ["COMMIT_HASH"],
+                                      "repo_name": os.environ["REPO_NAME"]}, timeout=10)
+              print(r.json()["id"])
+          except Exception as e:
+              import sys; print(f"HUD 서버 응답 없음 — 텔레메트리 생략 ({e.__class__.__name__})", file=sys.stderr)
+          PY
+          ) || true
           echo "RUN_ID=$RES" >> "$GITHUB_ENV"
+          [ -n "$RES" ] || exit 0
           export RUN_ID="$RES"
-          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/log', json={'log': '--- Starting Coral NPU CI Pipeline ('+os.environ['REPO_NAME']+') ---'}, timeout=10)"
+          python3 -c "import requests, os; requests.post('https://sota.pusan.ac.kr/cicd/api/runs/'+os.environ['RUN_ID']+'/log', json={'log': '--- Starting Coral NPU CI Pipeline ('+os.environ['REPO_NAME']+') ---'}, timeout=10)" || true
 
       - name: "[HUD] Correctness 상태 업데이트 (Running)"
         continue-on-error: true

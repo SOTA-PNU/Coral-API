@@ -27,6 +27,9 @@ ELF="$BUILD/elf"
 # 주의: v2 시뮬레이터의 RVV 는 VLEN=128 (vlenb=16) 이다. +zvl256b 를 주면 LLVM 이
 # VLMAX=8 을 가정한 코드를 내고 시뮬레이터는 vl 을 4 로 잘라 결과가 조용히 깨진다.
 CORAL_CPU_FEATURES="${CORAL_CPU_FEATURES:-+m,+f,+zicsr,+zmmul}"
+# 추가 iree-compile 옵션 실험용. 예:
+#   CORAL_IREE_EXTRA_FLAGS="--iree-opt-data-tiling --iree-global-opt-use-im2col-for-convs=true"
+CORAL_IREE_EXTRA_FLAGS="${CORAL_IREE_EXTRA_FLAGS:-}"
 IREE_BUILD_DIR="${IREE_BUILD_DIR:-/workspace/iree-build}"
 IREE_SRC_DIR="${IREE_SRC_DIR:-/workspace/iree}"
 CORALNPU_DIR="${CORALNPU_DIR:-/workspace/coralnpu}"
@@ -54,6 +57,7 @@ echo "=== [3] iree-compile ($MODEL) -> VMFB + 커널 ==="
     --iree-vm-target-index-bits=32 \
     --iree-vm-emit-polyglot-zip=false \
     --iree-opt-level=O2 \
+    $CORAL_IREE_EXTRA_FLAGS \
     -o model.vmfb )
 ls -la "$BUILD/model.vmfb" "$BUILD/model.o" | awk '{printf "    %10d  %s\n", $5, $9}'
 
