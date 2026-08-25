@@ -22,11 +22,13 @@ ROOT="${CORAL_ROOT:-/workspace/lowering-project}"
 BUILD="$ROOT/build/$MODEL"
 ELF="$BUILD/elf"
 
-# 실험 노브: CPU 피처를 바꿔 벡터화 효과를 잰다. 기본값은 기존과 동일(스칼라).
-#   CORAL_CPU_FEATURES="+m,+f,+zicsr,+zmmul,+zve32x,+zvl128b" ./build_coral.sh <model>
-# 주의: v2 시뮬레이터의 RVV 는 VLEN=128 (vlenb=16) 이다. +zvl256b 를 주면 LLVM 이
-# VLMAX=8 을 가정한 코드를 내고 시뮬레이터는 vl 을 4 로 잘라 결과가 조용히 깨진다.
-CORAL_CPU_FEATURES="${CORAL_CPU_FEATURES:-+m,+f,+zicsr,+zmmul}"
+# CPU 피처. 기본값은 RVV 벡터화 (+zve32x,+zvl128b) — lenet5/charrnn 에서
+# 스칼라와 비트 단위 동일 출력, 사이클 -23%/-33% 로 검증됨 (experiments/ 참고).
+# 스칼라 비교 실험: CORAL_CPU_FEATURES="+m,+f,+zicsr,+zmmul" ./build_coral.sh <model>
+# 주의: v2 시뮬레이터의 RVV 는 VLEN=128 (vlenb=16) 이다. +zvl256b/512b 를 주면
+# LLVM 이 더 넓은 VLMAX 를 가정한 코드를 내고 시뮬레이터는 vl 을 자르기 때문에
+# 트랩 없이 결과만 조용히 깨진다. +v/+c/+d/+a 는 칩에 없는 확장이라 즉시 크래시.
+CORAL_CPU_FEATURES="${CORAL_CPU_FEATURES:-+m,+f,+zicsr,+zmmul,+zve32x,+zvl128b}"
 # 추가 iree-compile 옵션 실험용. 예:
 #   CORAL_IREE_EXTRA_FLAGS="--iree-opt-data-tiling --iree-global-opt-use-im2col-for-convs=true"
 CORAL_IREE_EXTRA_FLAGS="${CORAL_IREE_EXTRA_FLAGS:-}"
