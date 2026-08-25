@@ -42,7 +42,8 @@ echo "=== [3] iree-compile ($MODEL) -> VMFB + 커널 ==="
     --iree-llvmcpu-target-triple=riscv32-unknown-elf \
     --iree-llvmcpu-target-cpu=generic-rv32 \
     --iree-llvmcpu-target-abi=ilp32 \
-    --iree-llvmcpu-target-cpu-features=+m,+f,+zicsr,+zmmul,+zve32x,+a,+d,+c,+v,+zvl512b,+rv64gc \
+    # --iree-llvmcpu-target-cpu-features=+m,+f,+zicsr,+zmmul,+zve32x,+a,+d,+c,+v,+zvl512b,+rv64gc \
+    --iree-llvmcpu-target-cpu-features=+m,+f,+zicsr,+zmmul,+zve32x,+zvl128b\
     --iree-opt-data-tiling \
     --iree-global-opt-use-im2col-for-convs=true \
     --iree-llvmcpu-link-embedded=false \
