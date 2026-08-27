@@ -1,0 +1,59 @@
+diff --git a/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp b/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp
+index 4b04151f..263a6bc3 100644
+--- a/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp
++++ b/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp
+@@ -33,6 +33,17 @@ template <> struct QuantInfo<AtenReluOp> {
+   static constexpr unsigned operandsToQuantize[1] = {0};
+ };
+ 
++// max_pool2d 의 나머지 피연산자는 커널/스트라이드 리스트라 추적 대상이 아니다.
++template <> struct QuantInfo<AtenMaxPool2dOp> {
++  static constexpr unsigned operandsToQuantize[1] = {0};
++};
++
++// avg_pool2d: 평균은 scale/zp 를 보존한다 (avg(s(q-z)) = s(avg(q)-z)).
++// 정수 경로는 tosa.avg_pool2d(acc i32)로 내려가며 반올림 차이만 발생한다.
++template <> struct QuantInfo<AtenAvgPool2dOp> {
++  static constexpr unsigned operandsToQuantize[1] = {0};
++};
++
+ // A QCommutingOp is an Op satisfying:
+ // 1. Has at most one tensor operand at index 0
+ // 2. Has a single output, which is a tensor
+@@ -110,6 +121,16 @@ public:
+           chain.MPTQTOpd = MPTQTOp.getOperand(0);
+           chain.scale = MPTQTOp.getOperand(1);
+           chain.zeroPoint = MPTQTOp.getOperand(2);
++          // dynamic(runtime scale/zp): skip integer fusion -> keep float
++          // (dequant->fp->quant). TOSA integer matmul/conv require a
++          // compile-time-constant zero-point, so a runtime zp cannot be fused.
++          {
++            double sC;
++            int64_t zC;
++            if (!matchPattern(chain.scale, m_TorchConstantFloat(&sC)) ||
++                !matchPattern(chain.zeroPoint, m_TorchConstantInt(&zC)))
++              chain.MPTQTOpd = Value();
++          }
+         }
+         // either a dequant was found or chain broken, so break loop
+         break;
+@@ -459,10 +480,18 @@ public:
+         RemoveUnused<AtenConstantPadNdOp>,
+         QuantizeOperandsPastCommutingOps<AtenConvolutionOp, 5>,
+         QuantizeOperandsPastCommutingOps<AtenReluOp, 0>,
++        // max_pool2d 는 단조 연산이라 양자화와 정확히 교환된다 (relu 와 동일 취급).
++        // 이게 없으면 PT2E reference 그래프의 dq→maxpool→q 가 float 로 남아
++        // 커널이 f32 풀링 디스패치로 떨어진다.
++        QuantizeOperandsPastCommutingOps<AtenMaxPool2dOp, 0>,
++        QuantizeOperandsPastCommutingOps<AtenAvgPool2dOp, 0>,
+         QuantizeOperandsPastCommutingOps<AtenMatmulOp, 2>,
+         QuantizeOperandsPastCommutingOps<AtenMmOp, 4>,
+         QuantizeAccumulator<AtenMmOp>, QuantizeAccumulator<AtenMatmulOp>,
+-        QuantizeResultLikeOperand<AtenReluOp>, QuantizeBias<AtenConvolutionOp>>(
++        QuantizeResultLikeOperand<AtenReluOp>,
++        QuantizeResultLikeOperand<AtenMaxPool2dOp>,
++        QuantizeResultLikeOperand<AtenAvgPool2dOp>,
++        QuantizeBias<AtenConvolutionOp>>(
+         context);
+ 
+     GreedyRewriteConfig config;
