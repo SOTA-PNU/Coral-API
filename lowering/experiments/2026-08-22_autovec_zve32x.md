@@ -65,6 +65,25 @@ LSTM(행렬-벡터 곱 위주)이 conv 보다 자동 벡터화 이득이 크다.
 또한: 잘못된 피처 문자열(+c,+v,+d,+zvl512b 등)은 stage=1 크래시를 낸다.
 칩은 C/A/D 확장이 없고(misa 0x40201120) ELEN=32, VLEN=128 이다.
 
+## 추가: 완전 정수화 1단계 — maxpool (2026-08-27)
+
+원인: PT2E reference 그래프의 dq→maxpool→q 를 torch-mlir `FuseQuantizedOps` 가
+접지 못했다. `QuantInfo` 트레이트 기본값 {0,1} 이 커널 크기 리스트(피연산자 1)까지
+양자화 추적을 요구 → "Partially traced" 로 포기. relu 처럼 {0} 특수화 + 패턴 등록
+2건으로 해결 (torch-mlir 포크 FuseQuantizedOps.cpp, ~10줄).
+
+| lenet5 빌드 | 사이클 | 내부 f32 디스패치 | 정확도 |
+|---|---|---|---|
+| 벡터 (maxpool f32) | 2,032,503 | 2 | ✓ |
+| **벡터 + 완전 int8** (`build/lenet5_int8`) | **1,853,255 (-8.8%)** | **0** | ✓ 상대L2 0.00, top-1 일치 |
+
+스칼라 대비 누적 -29.4%. maxpool 은 단조 연산이라 정수화가 수학적으로 무손실
+— 출력 비트 동일이 그 증거. 경계 q/dq(dispatch_0/8)만 f32 로 남으며 이는 ABI.
+
+완전 int8 산출물은 `build/<모델>_int8/` 로 분리 저장한다 (mainline 과 구분).
+다음 대상: resnet18/vgg 의 avgpool (정수 합산+rescale, 반올림 차이 검증 필요),
+charrnn 의 sigmoid/tanh (tosa.table LUT, 정확도 재검증 필수).
+
 ## 다음
 
 - charrnn 등 다른 모델의 auto-vec 수치 추가 (같은 플래그).
