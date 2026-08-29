@@ -1,0 +1,1149 @@
+diff --git a/build_tools/autogen_ltc_backend.yaml b/build_tools/autogen_ltc_backend.yaml
+index bfc46416..144081f6 100644
+--- a/build_tools/autogen_ltc_backend.yaml
++++ b/build_tools/autogen_ltc_backend.yaml
+@@ -1,4 +1,15 @@
+ blacklist:
++# Scalar/Device-less ops that break LTC codegen (PyTorch 2.13+)
++- _assert_scalar
++- sym_constrain_range
++- sym_constrain_range_for_size
++- _print
++- _assert_tensor_metadata
++# rrelu_with_noise wrapper codegen mismatch on PyTorch 2.13+
++- rrelu_with_noise
++- rrelu_with_noise_
++- rrelu_with_noise.out
++- rrelu_with_noise_backward
+ # Disabled in favour of `aten::index_put` which supports optional indices via `hacked_twin` JIT hack.
+ # It also doesn't have confusing `unsafe` argument.
+ - _index_put_impl
+diff --git a/include/torch-mlir/Dialect/TorchConversion/Transforms/Passes.h b/include/torch-mlir/Dialect/TorchConversion/Transforms/Passes.h
+index 0cb13aff..90270f0c 100644
+--- a/include/torch-mlir/Dialect/TorchConversion/Transforms/Passes.h
++++ b/include/torch-mlir/Dialect/TorchConversion/Transforms/Passes.h
+@@ -33,6 +33,8 @@ struct LinalgOnTensorsBackendPipelineOptions
+       llvm::cl::init(true)};
+ };
+ 
++
++
+ /// Creates a pipeline that lowers from the torch backend contract to the
+ /// linalg-on-tensors backend contract.
+ void createTorchBackendToLinalgOnTensorsBackendPipeline(
+diff --git a/lib/Conversion/TorchToTosa/TorchToTosa.cpp b/lib/Conversion/TorchToTosa/TorchToTosa.cpp
+index 7c3de6f2..96af22e1 100644
+--- a/lib/Conversion/TorchToTosa/TorchToTosa.cpp
++++ b/lib/Conversion/TorchToTosa/TorchToTosa.cpp
+@@ -18,6 +18,7 @@
+ #include "mlir/IR/Matchers.h"
+ #include "mlir/Pass/Pass.h"
+ #include "mlir/Transforms/DialectConversion.h"
++#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+ #include "torch-mlir/Conversion/Passes.h"
+ #include "torch-mlir/Conversion/TorchToTosa/TosaLegalizeCommon.h"
+ #include "torch-mlir/Conversion/TorchToTosa/TosaLegalizeUtils.h"
+@@ -1189,9 +1190,30 @@ LogicalResult ConvertAtenOp<AtenReluOp>::matchAndRewriteImpl(
+   }
+ 
+   // Rescale self for quantized types. TBD
++  // if (!isa<mlir::FloatType>(selfTy.getElementType())) {
++  //   return rewriter.notifyMatchFailure(
++  //       op, "Only floating-point datatype legalization currently supported");
++  // }
++  // Integer/quantized types: relu == clamp(0, type_max).
++  // For symmetric quantization the accumulator zero-point is 0, so the
++  // real-value-zero threshold maps to integer 0.
++  // FIXED RELU
++  if (auto intTy = dyn_cast<mlir::IntegerType>(selfTy.getElementType())) {
++    int64_t maxInt = intTy.isUnsigned()
++                         ? (int64_t)llvm::maxUIntN(intTy.getWidth())
++                         : llvm::maxIntN(intTy.getWidth());
++    rewriter.replaceOpWithNewOp<tosa::ClampOp>(
++        op, outTy, self,
++        rewriter.getIntegerAttr(outElemTy, 0),
++        rewriter.getIntegerAttr(outElemTy, maxInt),
++        tosa::NanPropagationModeAttr::get(rewriter.getContext(),
++                                          tosa::NanPropagationMode::PROPAGATE));
++    return success();
++  }
++
+   if (!isa<mlir::FloatType>(selfTy.getElementType())) {
+     return rewriter.notifyMatchFailure(
+-        op, "Only floating-point datatype legalization currently supported");
++        op, "Only floating-point and integer datatypes are supported");
+   }
+ 
+   FloatAttr minFloatAttr, maxFloatAttr;
+@@ -10383,6 +10405,18 @@ class ConvertDequantizeOp : public TorchToTosaOpConversionPattern<AtenOpT> {
+       if (mlir::tosa::EqualizeRanks(rewriter, loc, intValue, intZp).failed())
+         return rewriter.notifyMatchFailure(
+             op, "Failed to equalize ranks among operands for sub op");
++    } else if (auto zpIt = zp.getDefiningOp<AtenIntTensorOp>()) {
++      // runtime per-tensor zp (dynamic asymmetric): recover [1] tensor, broadcast
++      Value zpT = rewriter.getRemappedValue(zpIt.getA());
++      if (!zpT)
++        return rewriter.notifyMatchFailure(op, "runtime zp tensor unavailable");
++      auto zpTy = dyn_cast<RankedTensorType>(zpT.getType());
++      if (!zpTy)
++        return rewriter.notifyMatchFailure(op, "runtime zp not ranked tensor");
++      intZp = tosa::CastOp::create(
++          rewriter, loc, RankedTensorType::get(zpTy.getShape(), elemIntTy), zpT);
++      if (mlir::tosa::EqualizeRanks(rewriter, loc, intValue, intZp).failed())
++        return rewriter.notifyMatchFailure(op, "Failed to equalize ranks (zp)");
+     } else {
+       // Per-channel case: zero_point is a tensor.
+       // Reshape to match rank and cast it to the intermediate integer type.
+@@ -10400,12 +10434,62 @@ class ConvertDequantizeOp : public TorchToTosaOpConversionPattern<AtenOpT> {
+     Value floatResult =
+         tosa::CastOp::create(rewriter, loc, resultTensorTy, subResult);
+ 
++    std::function<Value(Value)> materializeScalarFloatAsTensor =
++        [&](Value v) -> Value {
++      double c;
++      if (matchPattern(v, m_TorchConstantFloat(&c))) {           // 상수 → 0d const
++        auto ty = RankedTensorType::get({}, elemFpTy);
++        return tosa::ConstOp::create(
++            rewriter, loc, ty,
++            DenseElementsAttr::get(ty, rewriter.getFloatAttr(elemFpTy, c)));
++      }
++      if (auto ft = v.getDefiningOp<AtenFloatTensorOp>()) {       // Float.Tensor(t) → t
++        Value t = rewriter.getRemappedValue(ft.getA());
++        if (!t) return Value();
++        auto tTy = dyn_cast<RankedTensorType>(t.getType());
++        if (!tTy) return Value();
++        auto castTy = RankedTensorType::get(tTy.getShape(), elemFpTy);
++        return tosa::CastOp::create(rewriter, loc, castTy, t);
++      }
++      if (auto mul = v.getDefiningOp<AtenMulFloatOp>()) {         // mul.float → tosa.mul
++        Value a = materializeScalarFloatAsTensor(mul.getA());
++        Value b = materializeScalarFloatAsTensor(mul.getB());
++        if (!a || !b) return Value();
++        if (mlir::tosa::EqualizeRanks(rewriter, loc, a, b).failed()) return Value();
++        auto aTy = dyn_cast<RankedTensorType>(a.getType());
++        if (!aTy) return Value();
++        return tosa::createMulOpAndCast(rewriter, op, aTy, a, b, /*shift=*/0);
++      }
++      return Value();
++    };
++
+     // Handle Scale
++    // Value floatScale;
++    // double scaleConst;
++    // if (matchPattern(scale, m_TorchConstantFloat(&scaleConst))) {
++    //   // Per-tensor case: scale is a scalar constant.
++    //   // Create 0d tensor and equalize rank
++    //   auto scaleType = RankedTensorType::get({}, elemFpTy);
++    //   auto scaleAttr = DenseElementsAttr::get(
++    //       scaleType, rewriter.getFloatAttr(elemFpTy, scaleConst));
++    //   floatScale =
++    //       tosa::ConstOp::create(rewriter, op->getLoc(), scaleType, scaleAttr);
++    //   if (mlir::tosa::EqualizeRanks(rewriter, loc, floatResult, floatScale)
++    //           .failed())
++    //     return rewriter.notifyMatchFailure(
++    //         op, "Failed to equalize ranks among operands for mul op");
++    // } else {
++    //   // Per-channel case: scale is a tensor.
++    //   // Reshape to match rank and cast it to the result float type.
++    //   scale = converter->materializeTargetConversion(
++    //       rewriter, loc, converter->convertType(scale.getType()), scale);
++    //   floatScale = alignQuantParamRankAndCast(scale, elemFpTy);
++    // }
++
+     Value floatScale;
+     double scaleConst;
+     if (matchPattern(scale, m_TorchConstantFloat(&scaleConst))) {
+-      // Per-tensor case: scale is a scalar constant.
+-      // Create 0d tensor and equalize rank
++      // (기존) per-tensor 상수 scale → 0d tosa.const
+       auto scaleType = RankedTensorType::get({}, elemFpTy);
+       auto scaleAttr = DenseElementsAttr::get(
+           scaleType, rewriter.getFloatAttr(elemFpTy, scaleConst));
+@@ -10415,9 +10499,18 @@ class ConvertDequantizeOp : public TorchToTosaOpConversionPattern<AtenOpT> {
+               .failed())
+         return rewriter.notifyMatchFailure(
+             op, "Failed to equalize ranks among operands for mul op");
++    } else if (!isa<Torch::ValueTensorType>(scale.getType())) {
++      // (신규) 런타임 스칼라 scale(!torch.float) → 텐서로 materialize
++      floatScale = materializeScalarFloatAsTensor(scale);
++      if (!floatScale)
++        return rewriter.notifyMatchFailure(
++            op, "could not materialize runtime scalar scale");
++      if (mlir::tosa::EqualizeRanks(rewriter, loc, floatResult, floatScale)
++              .failed())
++        return rewriter.notifyMatchFailure(
++            op, "Failed to equalize ranks (runtime scale)");
+     } else {
+-      // Per-channel case: scale is a tensor.
+-      // Reshape to match rank and cast it to the result float type.
++      // (기존) per-channel 텐서 scale
+       scale = converter->materializeTargetConversion(
+           rewriter, loc, converter->convertType(scale.getType()), scale);
+       floatScale = alignQuantParamRankAndCast(scale, elemFpTy);
+@@ -10440,35 +10533,193 @@ LogicalResult ConvertAtenOp<AtenQuantizePerTensorOp>::matchAndRewriteImpl(
+     ConversionPatternRewriter &rewriter) const {
+   Value input = adaptor.getSelf();
+   auto loc = op->getLoc();
+-
+-  // Get scale and zero_point as constants.
+-  double scaleConst;
+-  if (!matchPattern(op.getScale(), m_TorchConstantFloat(&scaleConst)))
+-    return rewriter.notifyMatchFailure(op, "scale must be a Scalar constant");
+-
+-  int64_t zpConst;
+-  if (!matchPattern(op.getZeroPoint(), m_TorchConstantInt(&zpConst)))
+-    return rewriter.notifyMatchFailure(op,
+-                                       "zero point must be a Scalar constant");
+-
+-  // Get input and result types.
+   auto inputTy = cast<RankedTensorType>(input.getType());
+   auto inputElemTy = inputTy.getElementType();
+   auto resultTy = cast<RankedTensorType>(
+       getTypeConverter()->convertType(op->getResult(0).getType()));
+   auto resultElemTy = resultTy.getElementType();
+ 
+-  // Rescale the input: input * (1.0 / scale)
+-  auto scaleReciprocal = 1.0 / scaleConst;
+-  auto scaleConstTensor = tosa::getConstTensor<float>(
+-                              rewriter, op, scaleReciprocal, {}, inputElemTy)
+-                              .value();
+-  if (mlir::tosa::EqualizeRanks(rewriter, loc, input, scaleConstTensor)
+-          .failed())
++  // zero point은 상수여야 함 (symmetric → %int0, Fix A가 보장)
++  int64_t zpConst = 0;
++  bool zpIsConst = matchPattern(op.getZeroPoint(), m_TorchConstantInt(&zpConst));
++
++  // ===== [PoC] REQUANT -> tosa.rescale fast-path =========================
++  // quantize_per_tensor( dequantize.self(
++  //     _make_per_tensor_quantized_tensor(%int8, sIn, zIn) ), sOut, zOut )
++  //   ==>  tosa.rescale(%int8, multiplier/shift = sIn/sOut)
++  // 정수 소스를 직접 rescale -> float round/clamp 대신 진짜 정수 requant.
++  if (zpIsConst)
++  if (auto dqOp = op.getSelf().getDefiningOp<AtenDequantizeSelfOp>()) {
++    if (auto mkOp = dqOp.getSelf()
++                        .getDefiningOp<Aten_MakePerTensorQuantizedTensorOp>()) {
++      double sIn, sOut;
++      int64_t zIn;
++      if (matchPattern(mkOp.getScale(), m_TorchConstantFloat(&sIn)) &&
++          matchPattern(mkOp.getZeroPoint(), m_TorchConstantInt(&zIn)) &&
++          matchPattern(op.getScale(), m_TorchConstantFloat(&sOut)) &&
++          sOut != 0.0) {
++        Value intSrc = rewriter.getRemappedValue(mkOp.getSelf());
++        if (intSrc) {
++          if (auto t = dyn_cast<RankedTensorType>(intSrc.getType())) {
++            if (t.getElementType().isInteger(8)) {
++              Value rescaled = tosa::buildRescale(
++                  rewriter, op, resultTy, intSrc, /*scale=*/sIn / sOut,
++                  /*input_zp=*/zIn, /*output_zp=*/zpConst,
++                  tosa::RoundingMode::SINGLE_ROUND, /*scale32=*/true);
++              rewriter.replaceOp(op, rescaled);
++              return success();
++            }
++          }
++        }
++      }
++    }
++  }
++  // ===== end fast-path ===================================================
++
++  // ===== [ext] conv/fc INTEGER REQUANT -> tosa.rescale ===================
++  // 정수 tosa.conv2d/matmul(i32 누적) 뒤 requant을 float round 대신 정수 rescale로.
++  //   conv: mul(cast(i32_relu), accScale)
++  //   fc  : clamp(min=0)( add( mul(cast(i32), accScale), biasReshape(const) ) )
++  // bias는 const에 대한 round(bias/accScale)->i32 연산으로 emit -> 상수폴딩됨.
++  // 무매칭 시 아래 float fallback으로 그대로 진행(회귀 없음).
++  if (zpIsConst) {
++    double sOutExt;
++    if (matchPattern(op.getScale(), m_TorchConstantFloat(&sOutExt)) &&
++        sOutExt != 0.0) {
++      // acc chain 매칭: v == mul(cast(i32), splatConstScale)
++      auto matchAccMul = [&](Value v, Value &intSrc, double &accScale) -> bool {
++        auto mulOp = v.getDefiningOp<tosa::MulOp>();
++        if (!mulOp)
++          return false;
++        Value cand[2] = {mulOp.getInput1(), mulOp.getInput2()};
++        DenseElementsAttr sAttr;
++        Value castV;
++        if (matchPattern(cand[1], m_Constant(&sAttr)))
++          castV = cand[0];
++        else if (matchPattern(cand[0], m_Constant(&sAttr)))
++          castV = cand[1];
++        else
++          return false;
++        if (!sAttr || !sAttr.isSplat())
++          return false;
++        auto castOp = castV.getDefiningOp<tosa::CastOp>();
++        if (!castOp)
++          return false;
++        auto it = dyn_cast<RankedTensorType>(castOp.getInput().getType());
++        if (!it || !it.getElementType().isInteger(32))
++          return false;
++        accScale = sAttr.getSplatValue<APFloat>().convertToDouble();
++        intSrc = castOp.getInput();
++        return accScale != 0.0;
++      };
++
++      Value cur = input;
++
++      // (1) relu peel: tosa.clamp(min_val == 0)
++      bool hasRelu = false;
++      if (auto clampOp = cur.getDefiningOp<tosa::ClampOp>()) {
++        if (auto fmin =
++                dyn_cast_or_null<FloatAttr>(clampOp.getMinValAttr())) {
++          if (fmin.getValueAsDouble() == 0.0) {
++            hasRelu = true;
++            cur = clampOp.getInput();
++          }
++        }
++      }
++
++      // (2) bias peel: tosa.add(accMul, biasVal)
++      Value biasVal;
++      Value intSrc;
++      double accScale = 0.0;
++      if (auto addOp = cur.getDefiningOp<tosa::AddOp>()) {
++        if (matchAccMul(addOp.getInput1(), intSrc, accScale))
++          biasVal = addOp.getInput2();
++        else if (matchAccMul(addOp.getInput2(), intSrc, accScale))
++          biasVal = addOp.getInput1();
++      }
++      bool matched = (bool)intSrc;
++      if (!matched)
++        matched = matchAccMul(cur, intSrc, accScale); // conv: bias 없음
++
++      if (matched) {
++        // (2b) bias -> i32 누적 도메인: round(bias/accScale). 상수라 폴딩됨.
++        if (biasVal) {
++          if (auto bfTy = dyn_cast<RankedTensorType>(biasVal.getType())) {
++            Value invS = tosa::getConstTensor<float>(
++                             rewriter, op, (float)(1.0 / accScale), {},
++                             bfTy.getElementType())
++                             .value();
++            if (mlir::tosa::EqualizeRanks(rewriter, loc, biasVal, invS)
++                    .succeeded()) {
++              Value bScaled = tosa::createMulOpAndCast(rewriter, op, bfTy,
++                                                       biasVal, invS, 0);
++              auto bRound =
++                  tosa::createRoundHalfToEven(rewriter, op, bScaled, bfTy);
++              if (bRound) {
++                Value bI32 = tosa::CastOp::create(
++                    rewriter, loc, bfTy.clone(rewriter.getI32Type()), *bRound);
++                if (mlir::tosa::EqualizeRanks(rewriter, loc, intSrc, bI32)
++                        .succeeded())
++                  intSrc = tosa::AddOp::create(rewriter, loc, intSrc.getType(),
++                                               intSrc, bI32)
++                               .getResult();
++              }
++            }
++          }
++        }
++
++        // (1b) relu -> i32 clamp(min=0) (accScale>0 이므로 real>=0 <=> acc>=0)
++        if (hasRelu) {
++          intSrc = tosa::ClampOp::create(
++                       rewriter, loc,
++                       cast<RankedTensorType>(intSrc.getType()), intSrc,
++                       rewriter.getI32IntegerAttr(0),
++                       rewriter.getI32IntegerAttr(
++                           std::numeric_limits<int32_t>::max()),
++                       tosa::NanPropagationModeAttr::get(
++                           rewriter.getContext(),
++                           tosa::NanPropagationMode::PROPAGATE))
++                       .getResult();
++        }
++
++        Value rescaled = tosa::buildRescale(
++            rewriter, op, resultTy, intSrc, /*scale=*/accScale / sOutExt,
++            /*input_zp=*/0, /*output_zp=*/zpConst,
++            tosa::RoundingMode::SINGLE_ROUND, /*scale32=*/true);
++        rewriter.replaceOp(op, rescaled);
++        return success();
++      }
++    }
++  }
++  // ===== end [ext] =======================================================
++
++  // scale: 상수(static) 또는 런타임([1] 텐서, dynamic). reciprocal(scale)을 텐서로.
++  Value scaleRecip;
++  double scaleConst;
++  if (matchPattern(op.getScale(), m_TorchConstantFloat(&scaleConst))) {
++    scaleRecip = tosa::getConstTensor<float>(
++                     rewriter, op, (float)(1.0 / scaleConst), {}, inputElemTy)
++                     .value();
++  } else if (auto ft = op.getScale().getDefiningOp<AtenFloatTensorOp>()) {
++    // dynamic: aten.Float.Tensor(scaleT)에서 [1] 텐서 복구
++    Value scaleT = rewriter.getRemappedValue(ft.getA());
++    if (!scaleT)
++      return rewriter.notifyMatchFailure(op, "runtime scale tensor unavailable");
++    auto scaleFTy = RankedTensorType::get(
++        cast<RankedTensorType>(scaleT.getType()).getShape(), inputElemTy);
++    Value scaleF = tosa::CastOp::create(rewriter, loc, scaleFTy, scaleT); // f64→f32
++    scaleRecip = mlir::tosa::ReciprocalOp::create(rewriter, loc, scaleFTy, scaleF);
++    if (ft->hasOneUse())
++      rewriter.eraseOp(ft); // 이 quantize 단독 소비 → dead 정리
++  } else {
+     return rewriter.notifyMatchFailure(
+-        op, "Failed to equalize ranks among operands");
++        op, "scale must be a constant or aten.Float.Tensor");
++  }
++
++  if (mlir::tosa::EqualizeRanks(rewriter, loc, input, scaleRecip).failed())
++    return rewriter.notifyMatchFailure(op, "Failed to equalize ranks");
+   Value rescaledInput = tosa::createMulOpAndCast(
+-      rewriter, op, inputTy, input, scaleConstTensor, /*shift =*/0);
++      rewriter, op, inputTy, input, scaleRecip, /*shift =*/0);
+ 
+   // Round
+   auto rounded =
+@@ -10478,11 +10729,27 @@ LogicalResult ConvertAtenOp<AtenQuantizePerTensorOp>::matchAndRewriteImpl(
+         op, "failed to implement round-half-to-even with TOSA ops");
+   }
+ 
+-  // Add the zero point
+-  Value zpTensorFloat =
+-      tosa::getConstTensor<float>(rewriter, op, static_cast<float>(zpConst), {},
+-                                  inputElemTy)
+-          .value();
++  // Add the zero point: 상수(static/symmetric) 또는 런타임([1] 텐서, dynamic asymmetric)
++  Value zpTensorFloat;
++  if (zpIsConst) {
++    zpTensorFloat =
++        tosa::getConstTensor<float>(rewriter, op, static_cast<float>(zpConst),
++                                    {}, inputElemTy)
++            .value();
++  } else if (auto it = op.getZeroPoint().getDefiningOp<AtenIntTensorOp>()) {
++    // dynamic: aten.Int.Tensor(zpT)에서 [1] 텐서 복구 -> float 캐스트
++    Value zpT = rewriter.getRemappedValue(it.getA());
++    if (!zpT)
++      return rewriter.notifyMatchFailure(op, "runtime zp tensor unavailable");
++    auto zpFTy = RankedTensorType::get(
++        cast<RankedTensorType>(zpT.getType()).getShape(), inputElemTy);
++    zpTensorFloat = tosa::CastOp::create(rewriter, op->getLoc(), zpFTy, zpT);
++    if (it->hasOneUse())
++      rewriter.eraseOp(it);
++  } else {
++    return rewriter.notifyMatchFailure(
++        op, "zero point must be a constant or aten.Int.Tensor");
++  }
+   if (mlir::tosa::EqualizeRanks(rewriter, loc, *rounded, zpTensorFloat)
+           .failed())
+     return failure();
+@@ -10526,6 +10793,194 @@ LogicalResult ConvertAtenOp<AtenQuantizePerTensorOp>::matchAndRewriteImpl(
+ // -----------------------------------------------------------------------------
+ 
+ namespace {
++// ===== [ext-postpass] float requant idiom -> tosa.rescale =====
++// TorchToTosa 변환이 끝나 IR이 정착된 뒤 greedy로 실행.
++// 매칭: cast(f32->i8)( clamp( add( select(floor(X),ceil(X)), zpOut ) ) )
++//   X = mul(quantInput, 1/sOut);  quantInput = [clampRelu]([add(_,bias)]) mul(cast(i32_acc), accScale)
++// => tosa.rescale(i32_acc[+bias][relu], scale = accScale/sOut, out_zp = zpOut)
++namespace {
++struct FoldRequantToRescale : public OpRewritePattern<tosa::CastOp> {
++  using OpRewritePattern<tosa::CastOp>::OpRewritePattern;
++
++  static bool splatF(Value v, double &out) {
++    DenseElementsAttr a;
++    if (!matchPattern(v, m_Constant(&a)) || !a.isSplat())
++      return false;
++    if (!isa<FloatType>(a.getElementType()))
++      return false;
++    out = a.getSplatValue<APFloat>().convertToDouble();
++    return true;
++  }
++
++  // v == mul(cast(i32src), splatScale)  ->  intSrc, accScale
++  static bool matchAccMul(Value v, Value &intSrc, double &accScale) {
++    auto m = v.getDefiningOp<tosa::MulOp>();
++    if (!m)
++      return false;
++    Value a = m.getInput1(), b = m.getInput2();
++    Value castV;
++    if (splatF(b, accScale))
++      castV = a;
++    else if (splatF(a, accScale))
++      castV = b;
++    else
++      return false;
++    auto co = castV.getDefiningOp<tosa::CastOp>();
++    if (!co)
++      return false;
++    auto it = dyn_cast<RankedTensorType>(co.getInput().getType());
++    if (!it || !it.getElementType().isInteger(32))
++      return false;
++    intSrc = co.getInput();
++    return accScale != 0.0;
++  }
++
++  LogicalResult matchAndRewrite(tosa::CastOp castOp,
++                                PatternRewriter &rewriter) const override {
++    auto outTy = dyn_cast<RankedTensorType>(castOp.getType());
++    auto inTy = dyn_cast<RankedTensorType>(castOp.getInput().getType());
++    if (!outTy || !inTy)
++      return failure();
++    if (!outTy.getElementType().isInteger(8) ||
++        !isa<FloatType>(inTy.getElementType()))
++      return failure();
++
++    // clamp( add( rounded, zpOut ) )
++    auto clampOp = castOp.getInput().getDefiningOp<tosa::ClampOp>();
++    if (!clampOp)
++      return failure();
++    auto addZp = clampOp.getInput().getDefiningOp<tosa::AddOp>();
++    if (!addZp)
++      return failure();
++    double zpF;
++    Value rounded;
++    if (splatF(addZp.getInput2(), zpF))
++      rounded = addZp.getInput1();
++    else if (splatF(addZp.getInput1(), zpF))
++      rounded = addZp.getInput2();
++    else
++      return failure();
++    int64_t zpOut = static_cast<int64_t>(std::llround(zpF));
++
++    // rounded = select(cond, floor(X), ceil(X)); on_true=floor  (operand 1)
++    auto selOp = rounded.getDefiningOp<tosa::SelectOp>();
++    if (!selOp)
++      return failure();
++    auto floorOp = selOp->getOperand(1).getDefiningOp<tosa::FloorOp>();
++    if (!floorOp)
++      return failure();
++    Value rescaledInput = floorOp->getOperand(0); // = mul(quantInput, 1/sOut)
++
++    auto sMul = rescaledInput.getDefiningOp<tosa::MulOp>();
++    if (!sMul)
++      return failure();
++    double invSOut;
++    Value quantInput;
++    if (splatF(sMul.getInput2(), invSOut))
++      quantInput = sMul.getInput1();
++    else if (splatF(sMul.getInput1(), invSOut))
++      quantInput = sMul.getInput2();
++    else
++      return failure();
++    if (invSOut == 0.0)
++      return failure();
++    double sOut = 1.0 / invSOut;
++
++    // peel: [relu clamp(min=0)] [add(_, bias)] mul(cast(i32), accScale)
++    Value cur = quantInput;
++    bool hasRelu = false;
++    if (auto rc = cur.getDefiningOp<tosa::ClampOp>()) {
++      if (auto fmin = dyn_cast_or_null<FloatAttr>(rc.getMinValAttr()))
++        if (fmin.getValueAsDouble() == 0.0) {
++          hasRelu = true;
++          cur = rc.getInput();
++        }
++    }
++    Value biasVal, intSrc;
++    double accScale = 0.0;
++    if (auto ad = cur.getDefiningOp<tosa::AddOp>()) {
++      if (matchAccMul(ad.getInput1(), intSrc, accScale))
++        biasVal = ad.getInput2();
++      else if (matchAccMul(ad.getInput2(), intSrc, accScale))
++        biasVal = ad.getInput1();
++    }
++    if (!intSrc && !matchAccMul(cur, intSrc, accScale))
++      return failure();
++
++    // conv relu: intSrc == i32 clamp(min=0)(conv) -> bypass, mark relu.
++    // (i32 tosa.clamp은 TOSA 프로파일 위반이므로 우회하고 relu는 rescale 뒤 i8 clamp로 재적용)
++    if (auto ic = intSrc.getDefiningOp<tosa::ClampOp>()) {
++      if (auto mn = dyn_cast_or_null<IntegerAttr>(ic.getMinValAttr()))
++        if (mn.getInt() == 0) {
++          hasRelu = true;
++          intSrc = ic.getInput();
++        }
++    }
++
++    Location loc = castOp.getLoc();
++
++    // bias -> i32 누적 도메인: floor(bias/accScale + 0.5). 상수라 폴딩됨.
++    if (biasVal) {
++      if (auto bfTy = dyn_cast<RankedTensorType>(biasVal.getType())) {
++        if (isa<FloatType>(bfTy.getElementType())) {
++          Value inv = tosa::getConstTensor<float>(
++                          rewriter, castOp, (float)(1.0 / accScale), {},
++                          bfTy.getElementType())
++                          .value();
++          Value half = tosa::getConstTensor<float>(rewriter, castOp, 0.5f, {},
++                                                   bfTy.getElementType())
++                           .value();
++          if (mlir::tosa::EqualizeRanks(rewriter, loc, biasVal, inv)
++                  .succeeded()) {
++            Value scaled = tosa::createMulOpAndCast(rewriter, castOp, bfTy,
++                                                    biasVal, inv, 0);
++            if (mlir::tosa::EqualizeRanks(rewriter, loc, scaled, half)
++                    .succeeded()) {
++              Value shifted =
++                  tosa::AddOp::create(rewriter, loc, bfTy, scaled, half)
++                      .getResult();
++              Value fl =
++                  tosa::FloorOp::create(rewriter, loc, bfTy, shifted).getResult();
++              Value bI32 = tosa::CastOp::create(
++                               rewriter, loc,
++                               bfTy.clone(rewriter.getI32Type()), fl)
++                               .getResult();
++              if (mlir::tosa::EqualizeRanks(rewriter, loc, intSrc, bI32)
++                      .succeeded())
++                intSrc = tosa::AddOp::create(rewriter, loc, intSrc.getType(),
++                                             intSrc, bI32)
++                             .getResult();
++            }
++          }
++        }
++      }
++    }
++
++    Value rescaled = tosa::buildRescale(
++        rewriter, castOp, outTy, intSrc, /*scale=*/accScale / sOut,
++        /*input_zp=*/0, /*output_zp=*/zpOut,
++        tosa::RoundingMode::SINGLE_ROUND, /*scale32=*/true);
++
++    // relu는 rescale 뒤 i8 clamp(min=zpOut, max=127)로 재적용.
++    // rescale이 단조증가 & rescale(0)=zpOut 이므로 max(x,0) 후 rescale == clamp(rescale(x), min=zpOut).
++    if (hasRelu) {
++      Type i8ty = outTy.getElementType();
++      rescaled = tosa::ClampOp::create(
++                     rewriter, loc, outTy, rescaled,
++                     rewriter.getIntegerAttr(i8ty, zpOut),
++                     rewriter.getIntegerAttr(i8ty, 127),
++                     tosa::NanPropagationModeAttr::get(
++                         rewriter.getContext(),
++                         tosa::NanPropagationMode::PROPAGATE))
++                     .getResult();
++    }
++    rewriter.replaceOp(castOp, rescaled);
++    return success();
++  }
++};
++} // namespace
++// ===== end [ext-postpass] struct =====
++
+ class ConvertTorchToTosa
+     : public impl::ConvertTorchToTosaBase<ConvertTorchToTosa> {
+ public:
+@@ -10594,6 +11049,27 @@ public:
+     if (failed(applyPartialConversion(getOperation(), target,
+                                       std::move(frozenPatterns))))
+       return signalPassFailure();
++
++    // ===== [ext-postpass] fold float requant idiom -> tosa.rescale =====
++    {
++      RewritePatternSet foldPatterns(context);
++      foldPatterns.add<FoldRequantToRescale>(context);
++      if (failed(applyPatternsGreedily(getOperation(), std::move(foldPatterns))))
++        return signalPassFailure();
++    }
++    // ===== end [ext-postpass] call =====
++    
++    bool changed = true;
++    while (changed) {
++      changed = false;
++      getOperation()->walk([&](Operation *o) {
++        if (isa<AtenFloatTensorOp, AtenIntTensorOp, AtenMulFloatOp>(o) &&
++            o->use_empty()) {
++          o->erase();
++          changed = true;
++        }
++      });
++    }
+   }
+ };
+ } // namespace
+@@ -10613,6 +11089,9 @@ void populateTorchToTosaConversionLegalOps(ConversionTarget &target) {
+   target.addLegalOp<ConstantDeviceOp>();
+   target.addLegalOp<PrimListConstructOp>();
+   target.addLegalOp<PrimTupleConstructOp>();
++  target.addLegalOp<AtenFloatTensorOp>();
++  target.addLegalOp<AtenIntTensorOp>();
++  target.addLegalOp<AtenMulFloatOp>();
+   target.addDynamicallyLegalOp<tensor::CastOp>([](tensor::CastOp op) -> bool {
+     auto sourceType = dyn_cast<RankedTensorType>(op.getSource().getType());
+     auto resultType = dyn_cast<RankedTensorType>(op.getType());
+@@ -10967,7 +11446,6 @@ std::set<StringRef> populateTorchToTosaConversionPatternsAndIllegalOps(
+   INSERT_ATENOP_PATTERN(AtenCumsumOp);
+   INSERT_ATENOP_PATTERN(AtenQuantizePerTensorOp);
+ #undef INSERT_ATENOP_PATTERN
+-
+ #define INSERT_CLONE_ATENOP_PATTERN(AtenOp)                                    \
+   illegalOps.insert(AtenOp::getOperationName());                               \
+   patterns.addWithLabel<ConvertAtenCloneOp<AtenOp>>(                           \
+@@ -11015,4 +11493,4 @@ createConvertTorchToTosaPass(bool requireFullTosaConversion,
+   return std::make_unique<ConvertTorchToTosa>(options);
+ }
+ 
+-} // namespace mlir::torch
++} // namespace mlir::torch
+\ No newline at end of file
+diff --git a/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp b/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp
+index 4b04151f..263a6bc3 100644
+--- a/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp
++++ b/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp
+@@ -33,6 +33,17 @@ template <> struct QuantInfo<AtenReluOp> {
+   static constexpr unsigned operandsToQuantize[1] = {0};
+ };
+ 
++// max_pool2d 의 나머지 피연산자는 커널/스트라이드 리스트라 추적 대상이 아니다.
++template <> struct QuantInfo<AtenMaxPool2dOp> {
++  static constexpr unsigned operandsToQuantize[1] = {0};
++};
++
++// avg_pool2d: 평균은 scale/zp 를 보존한다 (avg(s(q-z)) = s(avg(q)-z)).
++// 정수 경로는 tosa.avg_pool2d(acc i32)로 내려가며 반올림 차이만 발생한다.
++template <> struct QuantInfo<AtenAvgPool2dOp> {
++  static constexpr unsigned operandsToQuantize[1] = {0};
++};
++
+ // A QCommutingOp is an Op satisfying:
+ // 1. Has at most one tensor operand at index 0
+ // 2. Has a single output, which is a tensor
+@@ -110,6 +121,16 @@ public:
+           chain.MPTQTOpd = MPTQTOp.getOperand(0);
+           chain.scale = MPTQTOp.getOperand(1);
+           chain.zeroPoint = MPTQTOp.getOperand(2);
++          // dynamic(runtime scale/zp): skip integer fusion -> keep float
++          // (dequant->fp->quant). TOSA integer matmul/conv require a
++          // compile-time-constant zero-point, so a runtime zp cannot be fused.
++          {
++            double sC;
++            int64_t zC;
++            if (!matchPattern(chain.scale, m_TorchConstantFloat(&sC)) ||
++                !matchPattern(chain.zeroPoint, m_TorchConstantInt(&zC)))
++              chain.MPTQTOpd = Value();
++          }
+         }
+         // either a dequant was found or chain broken, so break loop
+         break;
+@@ -459,10 +480,18 @@ public:
+         RemoveUnused<AtenConstantPadNdOp>,
+         QuantizeOperandsPastCommutingOps<AtenConvolutionOp, 5>,
+         QuantizeOperandsPastCommutingOps<AtenReluOp, 0>,
++        // max_pool2d 는 단조 연산이라 양자화와 정확히 교환된다 (relu 와 동일 취급).
++        // 이게 없으면 PT2E reference 그래프의 dq→maxpool→q 가 float 로 남아
++        // 커널이 f32 풀링 디스패치로 떨어진다.
++        QuantizeOperandsPastCommutingOps<AtenMaxPool2dOp, 0>,
++        QuantizeOperandsPastCommutingOps<AtenAvgPool2dOp, 0>,
+         QuantizeOperandsPastCommutingOps<AtenMatmulOp, 2>,
+         QuantizeOperandsPastCommutingOps<AtenMmOp, 4>,
+         QuantizeAccumulator<AtenMmOp>, QuantizeAccumulator<AtenMatmulOp>,
+-        QuantizeResultLikeOperand<AtenReluOp>, QuantizeBias<AtenConvolutionOp>>(
++        QuantizeResultLikeOperand<AtenReluOp>,
++        QuantizeResultLikeOperand<AtenMaxPool2dOp>,
++        QuantizeResultLikeOperand<AtenAvgPool2dOp>,
++        QuantizeBias<AtenConvolutionOp>>(
+         context);
+ 
+     GreedyRewriteConfig config;
+diff --git a/lib/Dialect/Torch/Transforms/MatchQuantizedOps.cpp b/lib/Dialect/Torch/Transforms/MatchQuantizedOps.cpp
+index d873892b..b5744c43 100644
+--- a/lib/Dialect/Torch/Transforms/MatchQuantizedOps.cpp
++++ b/lib/Dialect/Torch/Transforms/MatchQuantizedOps.cpp
+@@ -41,7 +41,11 @@ public:
+   using OpRewritePattern::OpRewritePattern;
+   LogicalResult matchAndRewrite(OperatorOp op,
+                                 PatternRewriter &rewriter) const override {
+-    if (op.getName() == "torch.quantized_decomposed.quantize_per_tensor") {
++
++    // ── quantize_per_tensor 본체 (scale/zp는 "스칼라" Value) ──
++    auto emitQuantizePerTensor = [&](Value input, Value scale, Value zeroPoint,
++                                     Value quantMin, Value quantMax,
++                                     Value dtype) -> LogicalResult {
+       auto resultTy = cast<ValueTensorType>(op.getType(0));
+       auto qeTy = getQuantizedType(rewriter.getContext(), resultTy.getDtype());
+       if (!qeTy)
+@@ -50,19 +54,198 @@ public:
+       auto qTy =
+           rewriter.getType<ValueTensorType>(resultTy.getOptionalSizes(), qeTy);
+       Value quant = AtenQuantizePerTensorOp::create(
+-          rewriter, op.getLoc(), qTy,
+-          /*self=*/op.getOperand(0), /*scale=*/op.getOperand(1),
+-          /*zero_point=*/op.getOperand(2), /*dtype=*/op.getOperand(5));
++          rewriter, op.getLoc(), qTy, input, scale, zeroPoint, dtype);
+ 
+-      if (qTy != resultTy) {
++      if (qTy != resultTy)
+         quant = AtenIntReprOp::create(rewriter, op.getLoc(), resultTy, quant);
++
++      rewriter.replaceOpWithNewOp<AtenClampOp>(op, resultTy, quant, quantMin,
++                                               quantMax);
++      return success();
++    };
++
++    auto zpTensorToScalarInt = [&](Value zpTensor) -> Value {
++      // (1) 상수 literal이면 그 값으로 fold
++      if (auto lit = zpTensor.getDefiningOp<Torch::ValueTensorLiteralOp>()) {
++        if (auto dense = dyn_cast<DenseElementsAttr>(lit.getValue()))
++          if (dense.isSplat())
++            return Torch::ConstantIntOp::create(
++                rewriter, op.getLoc(),
++                rewriter.getI64IntegerAttr(dense.getSplatValue<APInt>().getSExtValue()));
+       }
++      // (2) 아직 재작성 안 된 choose_qparams_symmetric의 결과 → zp=0 확정 (순서 무관)
++      if (auto producer = zpTensor.getDefiningOp<OperatorOp>())
++        if (producer.getName() ==
++            "torch.quantized_decomposed.choose_qparams_symmetric.tensor")
++          return Torch::ConstantIntOp::create(rewriter, op.getLoc(),
++                                              rewriter.getI64IntegerAttr(0));
++      // (3) fallback
++      return AtenIntTensorOp::create(rewriter, op.getLoc(),
++                                    rewriter.getType<Torch::IntType>(), zpTensor);
++    };
++
++    // scalar 버전: scale=operand(1), zp=operand(2)
++    if (op.getName() == "torch.quantized_decomposed.quantize_per_tensor") {
++      return emitQuantizePerTensor(op.getOperand(0), op.getOperand(1),
++                                   op.getOperand(2), op.getOperand(3),
++                                   op.getOperand(4), op.getOperand(5));
++    }
++
++    // (A) dynamic 버전: scale/zp가 [1] 텐서 → 스칼라로 변환 후 같은 경로 재사용
++    if (op.getName() ==
++        "torch.quantized_decomposed.quantize_per_tensor.tensor") {
++      Value scale = AtenFloatTensorOp::create(
++          rewriter, op.getLoc(), rewriter.getType<Torch::FloatType>(),
++          op.getOperand(1));
++      // Value zeroPoint = AtenIntTensorOp::create(
++      //     rewriter, op.getLoc(), rewriter.getType<Torch::IntType>(),
++      //     op.getOperand(2));
++      Value zeroPoint = zpTensorToScalarInt(op.getOperand(2));
++      return emitQuantizePerTensor(op.getOperand(0), scale, zeroPoint,
++                                   op.getOperand(3), op.getOperand(4),
++                                   op.getOperand(5));
++    }
++
++    //========================================================================
++    // (B) choose_qparams.tensor : dynamic activation 런타임 scale/zp 계산
++    //     PyTorch determine_qparams (per_tensor_affine) 수식 그대로:
++    //       mn,mx = aminmax(x)
++    //       mnNeg = min(mn,0);  mxPos = max(mx,0)
++    //       scale = (mxPos-mnNeg)/(qmax-qmin);  scale = max(scale,eps)
++    //       zp    = clamp(qmin - round(mnNeg/scale), qmin, qmax)
++    //  NOTE: op 빌더 시그니처(특히 ToDtype/Rsub/dtype enum)는 빌드 에러 나오면
++    //        GeneratedTorchOps.td 기준으로 미세조정 필요할 수 있음.
++    //========================================================================
++    if (op.getName() == "torch.quantized_decomposed.choose_qparams.tensor") {
++      Location loc = op.getLoc();
++      Value input = op.getOperand(0);
++      Value qMin = op.getOperand(1); // !torch.int
++      Value qMax = op.getOperand(2); // !torch.int
++      Value eps = op.getOperand(3);  // !torch.float
++
++      auto scaleTy = cast<ValueTensorType>(op.getType(0)); // [1] f64
++      auto zpTy = cast<ValueTensorType>(op.getType(1));    // [1] si64
++
++      auto inTy = cast<ValueTensorType>(input.getType());
++      Type elemTy = inTy.getDtype(); // 보통 f32
++      auto sclr = rewriter.getType<ValueTensorType>(ArrayRef<int64_t>{}, elemTy);
++      auto vec1 = rewriter.getType<ValueTensorType>(ArrayRef<int64_t>{1}, elemTy);
++
++      Value zeroF =
++          Torch::ConstantFloatOp::create(rewriter, loc,
++                                         rewriter.getF64FloatAttr(0.0));
++      Value one = Torch::ConstantIntOp::create(rewriter, loc,
++                                               rewriter.getI64IntegerAttr(1));
++      Value zeroDim = Torch::ConstantIntOp::create(
++          rewriter, loc, rewriter.getI64IntegerAttr(0));
++
++      // mn, mx = aminmax(input)  (전체 reduce → 0-dim)
++      Value mn = AtenMinOp::create(rewriter, loc, sclr, input);
++      Value mx = AtenMaxOp::create(rewriter, loc, sclr, input);
++
++      // mnNeg = min(mn,0) ; mxPos = max(mx,0)
++      Value mnNeg = AtenClampMaxOp::create(rewriter, loc, sclr, mn, zeroF);
++      Value mxPos = AtenClampMinOp::create(rewriter, loc, sclr, mx, zeroF);
++
++      // scale = (mxPos - mnNeg) / (qMax - qMin)
++      Value range = AtenSubIntOp::create(
++          rewriter, loc, rewriter.getType<Torch::IntType>(), qMax, qMin);
++      Value span =
++          AtenSubTensorOp::create(rewriter, loc, sclr, mxPos, mnNeg, one);
++      Value scale = AtenDivScalarOp::create(rewriter, loc, sclr, span, range);
++      // scale = max(scale, eps)
++      scale = AtenClampMinOp::create(rewriter, loc, sclr, scale, eps);
++
++      // zp = clamp(qMin - round(mnNeg/scale), qMin, qMax)
++      Value q = AtenDivTensorOp::create(rewriter, loc, sclr, mnNeg, scale);
++      q = AtenRoundOp::create(rewriter, loc, sclr, q);
++      Value zpF = AtenRsubScalarOp::create(rewriter, loc, sclr, q, qMin, one);
++      zpF = AtenClampOp::create(rewriter, loc, sclr, zpF, qMin, qMax);
++
++      // [1] 로 unsqueeze 후 결과 dtype(f64 / si64)으로 캐스팅
++      Value scaleVec = AtenUnsqueezeOp::create(rewriter, loc, vec1, scale, zeroDim);
++      Value zpVec = AtenUnsqueezeOp::create(rewriter, loc, vec1, zpF, zeroDim);
++
++      Value none = Torch::ConstantNoneOp::create(rewriter, loc);
++      Value falseC = Torch::ConstantBoolOp::create(rewriter, loc, false);
++      // torch ScalarType enum: Double=7, Long(int64)=4
++      Value dblDtype = Torch::ConstantIntOp::create(
++          rewriter, loc, rewriter.getI64IntegerAttr(7));
++      Value longDtype = Torch::ConstantIntOp::create(
++          rewriter, loc, rewriter.getI64IntegerAttr(4));
++
++      Value scaleOut = AtenToDtypeOp::create(rewriter, loc, scaleTy, scaleVec,
++                                             dblDtype, falseC, falseC, none);
++      Value zpOut = AtenToDtypeOp::create(rewriter, loc, zpTy, zpVec, longDtype,
++                                          falseC, falseC, none);
++
++      rewriter.replaceOp(op, {scaleOut, zpOut});
++      return success();
++    }
++
++    if (op.getName() ==
++        "torch.quantized_decomposed.choose_qparams_symmetric.tensor") {
++      Location loc = op.getLoc();
++      Value input = op.getOperand(0);
++      Value qMin = op.getOperand(1); // !torch.int
++      Value qMax = op.getOperand(2); // !torch.int
++      Value eps = op.getOperand(3);  // !torch.float
++
++      auto scaleTy = cast<ValueTensorType>(op.getType(0)); // [1] f64
++      auto zpTy = cast<ValueTensorType>(op.getType(1));    // [1] si64
++
++      auto inTy = cast<ValueTensorType>(input.getType());
++      Type elemTy = inTy.getDtype();
++      auto sclr = rewriter.getType<ValueTensorType>(ArrayRef<int64_t>{}, elemTy);
++      auto vec1 = rewriter.getType<ValueTensorType>(ArrayRef<int64_t>{1}, elemTy);
++
++      Value zeroF = Torch::ConstantFloatOp::create(rewriter, loc,
++                                                  rewriter.getF64FloatAttr(0.0));
++      Value two = Torch::ConstantIntOp::create(rewriter, loc,
++                                              rewriter.getI64IntegerAttr(2));
++      Value zeroDim = Torch::ConstantIntOp::create(
++          rewriter, loc, rewriter.getI64IntegerAttr(0));
++
++      // mn, mx = aminmax(input)
++      Value mn = AtenMinOp::create(rewriter, loc, sclr, input);
++      Value mx = AtenMaxOp::create(rewriter, loc, sclr, input);
++
++      // min_neg = min(mn,0); max_pos = max(mx,0)
++      Value mnNeg = AtenClampMaxOp::create(rewriter, loc, sclr, mn, zeroF);
++      Value mxPos = AtenClampMinOp::create(rewriter, loc, sclr, mx, zeroF);
++
++      // max_pos = max(-min_neg, max_pos)
++      Value negMnNeg = AtenNegOp::create(rewriter, loc, sclr, mnNeg);
++      mxPos = AtenMaximumOp::create(rewriter, loc, sclr, negMnNeg, mxPos);
+ 
+-      rewriter.replaceOpWithNewOp<AtenClampOp>(
+-          op, resultTy, quant, op.getOperand(3), op.getOperand(4));
++      // scale = (max_pos / (qMax-qMin)) * 2 ;  scale = max(scale, eps)
++      Value range = AtenSubIntOp::create(
++          rewriter, loc, rewriter.getType<Torch::IntType>(), qMax, qMin);
++      Value scale = AtenDivScalarOp::create(rewriter, loc, sclr, mxPos, range);
++      scale = AtenMulScalarOp::create(rewriter, loc, sclr, scale, two);
++      scale = AtenClampMinOp::create(rewriter, loc, sclr, scale, eps);
++
++      // scale → [1] f64
++      Value scaleVec =
++          AtenUnsqueezeOp::create(rewriter, loc, vec1, scale, zeroDim);
++      Value none = Torch::ConstantNoneOp::create(rewriter, loc);
++      Value falseC = Torch::ConstantBoolOp::create(rewriter, loc, false);
++      Value dblDtype = Torch::ConstantIntOp::create(
++          rewriter, loc, rewriter.getI64IntegerAttr(7)); // ScalarType::Double
++      Value scaleOut = AtenToDtypeOp::create(rewriter, loc, scaleTy, scaleVec,
++                                            dblDtype, falseC, falseC, none);
++
++      // zp = 0 (상수 [1] si64 literal → downstream Int.Tensor가 상수 0으로 fold되길 기대)
++      auto zpLiteralTy =
++          RankedTensorType::get({1}, rewriter.getIntegerType(64)); // signless i64
++      Value zpOut = Torch::ValueTensorLiteralOp::create(
++          rewriter, loc, zpTy, DenseElementsAttr::get(zpLiteralTy, {APInt(64, 0)}));
++
++      rewriter.replaceOp(op, {scaleOut, zpOut});
+       return success();
+     }
+ 
++
+     auto prepareDequantize = [&](Value quantMin, Value quantMax, Value &clamp,
+                                  Type &qTy) {
+       clamp =
+@@ -85,7 +268,9 @@ public:
+       return success();
+     };
+ 
+-    if (op.getName() == "torch.quantized_decomposed.dequantize_per_tensor") {
++    // ── dequantize_per_tensor 본체 (scale/zp는 "스칼라" Value) ──
++    auto emitDequantizePerTensor = [&](Value scale,
++                                       Value zeroPoint) -> LogicalResult {
+       Value clamp;
+       Type qTy;
+       if (failed(prepareDequantize(op.getOperand(3), op.getOperand(4), clamp,
+@@ -93,11 +278,28 @@ public:
+         return failure();
+ 
+       auto quant = Aten_MakePerTensorQuantizedTensorOp::create(
+-          rewriter, op.getLoc(), qTy, clamp, op.getOperand(1),
+-          op.getOperand(2));
++          rewriter, op.getLoc(), qTy, clamp, scale, zeroPoint);
+       rewriter.replaceOpWithNewOp<AtenDequantizeTensorOp>(
+           op, op.getResultTypes(), quant);
+       return success();
++    };
++
++    // scalar 버전
++    if (op.getName() == "torch.quantized_decomposed.dequantize_per_tensor") {
++      return emitDequantizePerTensor(op.getOperand(1), op.getOperand(2));
++    }
++
++    // (A) dynamic 버전: scale/zp가 [1] 텐서 → 스칼라로 변환
++    if (op.getName() ==
++        "torch.quantized_decomposed.dequantize_per_tensor.tensor") {
++      Value scale = AtenFloatTensorOp::create(
++          rewriter, op.getLoc(), rewriter.getType<Torch::FloatType>(),
++          op.getOperand(1));
++      Value zeroPoint = zpTensorToScalarInt(op.getOperand(2));
++      // Value zeroPoint = AtenIntTensorOp::create(
++      //     rewriter, op.getLoc(), rewriter.getType<Torch::IntType>(),
++      //     op.getOperand(2));
++      return emitDequantizePerTensor(scale, zeroPoint);
+     }
+ 
+     if (op.getName() == "torch.quantized_decomposed.dequantize_per_channel") {
+@@ -141,3 +343,147 @@ createMatchQuantizedCustomOpsPass() {
+ }
+ 
+ } // namespace mlir::torch::Torch
++
++// //===----------------------------------------------------------------------===//
++// //
++// // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// // See https://llvm.org/LICENSE.txt for license information.
++// // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// // Also available under a BSD-style license. See LICENSE.
++// //
++// //===----------------------------------------------------------------------===//
++
++// #include "mlir/Dialect/Func/IR/FuncOps.h"
++// #include "mlir/Pass/Pass.h"
++// #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
++// #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
++// #include "torch-mlir/Dialect/Torch/Transforms/Passes.h"
++// #include "torch-mlir/Dialect/Torch/Utils/Utils.h"
++
++// using namespace mlir;
++// using namespace mlir::torch;
++// using namespace mlir::torch::Torch;
++// namespace mlir::torch::Torch {
++
++// #define GEN_PASS_DEF_MATCHQUANTIZEDCUSTOMOPS
++// #include "torch-mlir/Dialect/Torch/Transforms/Passes.h.inc"
++
++// namespace {
++
++// Type getQuantizedType(MLIRContext *context, Type t) {
++//   if (t.isSignlessInteger(8) || t.isUnsignedInteger(8))
++//     return Torch::QUInt8Type::get(context);
++//   if (t.isInteger(8) || t.isSignedInteger(8))
++//     return Torch::QInt8Type::get(context);
++//   if (t.isInteger(16))
++//     return Torch::QInt16Type::get(context);
++//   if (t.isInteger(32))
++//     return Torch::QInt32Type::get(context);
++//   return {};
++// }
++
++// class MatchQuantizeOperator : public OpRewritePattern<OperatorOp> {
++// public:
++//   using OpRewritePattern::OpRewritePattern;
++//   LogicalResult matchAndRewrite(OperatorOp op,
++//                                 PatternRewriter &rewriter) const override {
++//     if (op.getName() == "torch.quantized_decomposed.quantize_per_tensor") {
++//       auto resultTy = cast<ValueTensorType>(op.getType(0));
++//       auto qeTy = getQuantizedType(rewriter.getContext(), resultTy.getDtype());
++//       if (!qeTy)
++//         qeTy = resultTy.getDtype();
++
++//       auto qTy =
++//           rewriter.getType<ValueTensorType>(resultTy.getOptionalSizes(), qeTy);
++//       Value quant = AtenQuantizePerTensorOp::create(
++//           rewriter, op.getLoc(), qTy,
++//           /*self=*/op.getOperand(0), /*scale=*/op.getOperand(1),
++//           /*zero_point=*/op.getOperand(2), /*dtype=*/op.getOperand(5));
++
++//       if (qTy != resultTy) {
++//         quant = AtenIntReprOp::create(rewriter, op.getLoc(), resultTy, quant);
++//       }
++
++//       rewriter.replaceOpWithNewOp<AtenClampOp>(
++//           op, resultTy, quant, op.getOperand(3), op.getOperand(4));
++//       return success();
++//     }
++
++//     auto prepareDequantize = [&](Value quantMin, Value quantMax, Value &clamp,
++//                                  Type &qTy) {
++//       clamp =
++//           AtenClampOp::create(rewriter, op.getLoc(), op.getOperand(0).getType(),
++//                               op.getOperand(0), quantMin, quantMax);
++
++//       auto clampTy = cast<Torch::ValueTensorType>(clamp.getType());
++//       if (!clampTy.hasDtype())
++//         return rewriter.notifyMatchFailure(op,
++//                                            "dequantization has unknown dtype");
++
++//       Type dtype = clampTy.getDtype();
++//       Type qetype = getQuantizedType(op.getContext(), dtype);
++//       if (!qetype)
++//         return rewriter.notifyMatchFailure(op,
++//                                            "dequantization has unknown qtype");
++
++//       qTy = Torch::ValueTensorType::get(op.getContext(),
++//                                         clampTy.getOptionalSizes(), qetype);
++//       return success();
++//     };
++
++//     if (op.getName() == "torch.quantized_decomposed.dequantize_per_tensor") {
++//       Value clamp;
++//       Type qTy;
++//       if (failed(prepareDequantize(op.getOperand(3), op.getOperand(4), clamp,
++//                                    qTy)))
++//         return failure();
++
++//       auto quant = Aten_MakePerTensorQuantizedTensorOp::create(
++//           rewriter, op.getLoc(), qTy, clamp, op.getOperand(1),
++//           op.getOperand(2));
++//       rewriter.replaceOpWithNewOp<AtenDequantizeTensorOp>(
++//           op, op.getResultTypes(), quant);
++//       return success();
++//     }
++
++//     if (op.getName() == "torch.quantized_decomposed.dequantize_per_channel") {
++//       Value clamp;
++//       Type qTy;
++//       if (failed(prepareDequantize(op.getOperand(4), op.getOperand(5), clamp,
++//                                    qTy)))
++//         return failure();
++//       auto quant = Aten_MakePerChannelQuantizedTensorOp::create(
++//           rewriter, op.getLoc(), qTy, clamp, op.getOperand(1), op.getOperand(2),
++//           op.getOperand(3));
++//       rewriter.replaceOpWithNewOp<AtenDequantizeSelfOp>(op, op.getResultTypes(),
++//                                                         quant);
++//       return success();
++//     }
++
++//     return failure();
++//   }
++// };
++
++// class MatchQuantizedCustomOpsPass
++//     : public impl::MatchQuantizedCustomOpsBase<MatchQuantizedCustomOpsPass> {
++// public:
++//   void runOnOperation() override {
++//     MLIRContext *context = &getContext();
++//     RewritePatternSet patterns(context);
++//     patterns.insert<MatchQuantizeOperator>(context);
++
++//     GreedyRewriteConfig config;
++//     if (failed(
++//             applyPatternsGreedily(getOperation(), std::move(patterns), config)))
++//       return signalPassFailure();
++//   }
++// };
++
++// } // namespace
++
++// std::unique_ptr<OperationPass<func::FuncOp>>
++// createMatchQuantizedCustomOpsPass() {
++//   return std::make_unique<MatchQuantizedCustomOpsPass>();
++// }
++
++// } // namespace mlir::torch::Torch

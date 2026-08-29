@@ -1,0 +1,246 @@
+diff --git a/samples/static_library/CMakeLists.txt b/samples/static_library/CMakeLists.txt
+index acd7fabe0a..5194b1e1db 100644
+--- a/samples/static_library/CMakeLists.txt
++++ b/samples/static_library/CMakeLists.txt
+@@ -52,19 +52,48 @@ SET_TARGET_PROPERTIES(
+ # place of CMake targets.
+ 
+ # Generate the embed data with the bytecode module
+-iree_c_embed_data(
+-  NAME
+-    simple_mul_c
+-  IDENTIFIER
+-    iree_samples_static_library_simple_mul
+-  SRCS
+-    simple_mul.vmfb
+-  C_FILE_OUTPUT
+-    simple_mul_c.c
+-  H_FILE_OUTPUT
+-    simple_mul_c.h
+-  FLATTEN
+-  PUBLIC
++# iree_c_embed_data(
++#   NAME
++#     simple_mul_c
++#   IDENTIFIER
++#     iree_samples_static_library_simple_mul
++#   SRCS
++#     simple_mul.vmfb
++#   C_FILE_OUTPUT
++#     simple_mul_c.c
++#   H_FILE_OUTPUT
++#     simple_mul_c.h
++#   FLATTEN
++#   PUBLIC
++# )
++
++# iree_c_embed_data(
++#   NAME model_vmfb_c
++#   IDENTIFIER model_vmfb
++#   SRCS /workspace/build/model.vmfb
++#   C_FILE_OUTPUT model_vmfb_c.c
++#   H_FILE_OUTPUT model_vmfb_c.h
++#   FLATTEN
++#   PUBLIC
++# )
++
++add_library(model_vmfb_blob STATIC
++  /workspace/build/model_vmfb_blob.o
++)
++
++add_library(model_kernels STATIC
++  /workspace/build/model.o
++)
++
++set_target_properties(
++  model_vmfb_blob
++  model_kernels
++  PROPERTIES LINKER_LANGUAGE C
++)
++
++target_include_directories(
++  model_kernels
++  PUBLIC /workspace/build
+ )
+ 
+ iree_cc_binary(
+@@ -73,12 +102,19 @@ NAME
+ SRCS
+   "create_bytecode_module.c"
+   "static_library_demo.c"
++# DEPS
++#   # ::simple_mul_c
++#   ::model_vmfb_c
++#   iree::runtime
++#   iree::hal::drivers::local_sync::sync_driver
++#   iree::hal::local::loaders::static_library_loader
++#   simple_mul
+ DEPS
+-  ::simple_mul_c
++  model_vmfb_blob
+   iree::runtime
+   iree::hal::drivers::local_sync::sync_driver
+   iree::hal::local::loaders::static_library_loader
+-  simple_mul
++  model_kernels
+ )
+ 
+ iree_lit_test(
+diff --git a/samples/static_library/create_bytecode_module.c b/samples/static_library/create_bytecode_module.c
+index 16edab6326..9454eaabec 100644
+--- a/samples/static_library/create_bytecode_module.c
++++ b/samples/static_library/create_bytecode_module.c
+@@ -6,18 +6,46 @@
+ #include <stdio.h>
+ 
+ #include "iree/vm/bytecode/module.h"
+-#include "samples/static_library/simple_mul_c.h"
++// #include "samples/static_library/simple_mul_c.h"
++// #include "model_vmfb_c.h"
++extern const unsigned char _binary_model_vmfb_start[];
++extern const unsigned char _binary_model_vmfb_end[];
+ 
+ // A function to create the bytecode module.
++// iree_status_t create_module(iree_vm_instance_t* instance,
++//                             iree_vm_module_t** out_module) {
++// //   const struct iree_file_toc_t* module_file_toc =
++// //     //   iree_samples_static_library_simple_mul_create();
++// //     model_vmfb_create();
++// //   iree_const_byte_span_t module_data =
++// //       iree_make_const_byte_span(module_file_toc->data, module_file_toc->size);
++//   iree_const_byte_span_t module_data = iree_make_const_byte_span(
++//     _binary_model_vmfb_start,
++//     (iree_host_size_t)(
++//         _binary_model_vmfb_end - _binary_model_vmfb_start));
++
++// //   iree_const_byte_span_t module_data = iree_make_const_byte_span(
++// //         _binary_model_vmfb_start,
++// //         (size_t)(_binary_model_vmfb_end - _binary_model_vmfb_start));
++//   return iree_vm_bytecode_module_create(
++//       instance, IREE_VM_BYTECODE_MODULE_FLAG_NONE, module_data,
++//       iree_allocator_null(), iree_vm_instance_allocator(instance), out_module);
++// }
++
+ iree_status_t create_module(iree_vm_instance_t* instance,
+                             iree_vm_module_t** out_module) {
+-  const struct iree_file_toc_t* module_file_toc =
+-      iree_samples_static_library_simple_mul_create();
+-  iree_const_byte_span_t module_data =
+-      iree_make_const_byte_span(module_file_toc->data, module_file_toc->size);
++  iree_const_byte_span_t module_data = iree_make_const_byte_span(
++      _binary_model_vmfb_start,
++      (iree_host_size_t)(
++          _binary_model_vmfb_end - _binary_model_vmfb_start));
++
+   return iree_vm_bytecode_module_create(
+-      instance, IREE_VM_BYTECODE_MODULE_FLAG_NONE, module_data,
+-      iree_allocator_null(), iree_vm_instance_allocator(instance), out_module);
++      instance,
++      IREE_VM_BYTECODE_MODULE_FLAG_NONE,
++      module_data,
++      iree_allocator_null(),
++      iree_vm_instance_allocator(instance),
++      out_module);
+ }
+ 
+ void print_success() { printf("static_library_run_bytecode passed\n"); }
+diff --git a/samples/static_library/static_library_demo.c b/samples/static_library/static_library_demo.c
+index dc161c78a6..d042389434 100644
+--- a/samples/static_library/static_library_demo.c
++++ b/samples/static_library/static_library_demo.c
+@@ -13,11 +13,14 @@
+ #include "iree/hal/local/loaders/static_library_loader.h"
+ #include "iree/modules/hal/module.h"
+ #include "iree/runtime/api.h"
++#include "model.h"
+ 
+-extern const iree_hal_executable_library_header_t**
+-simple_mul_dispatch_0_library_query(
+-    iree_hal_executable_library_version_t max_version,
+-    const iree_hal_executable_environment_v0_t* environment);
++
++
++// extern const iree_hal_executable_library_header_t**
++// simple_mul_dispatch_0_library_query(
++//     iree_hal_executable_library_version_t max_version,
++//     const iree_hal_executable_environment_v0_t* environment);
+ // A function to create the bytecode or C module.
+ extern iree_status_t create_module(iree_vm_instance_t* instance,
+                                    iree_vm_module_t** out_module);
+@@ -68,7 +71,8 @@ iree_status_t create_device_with_static_loader(iree_allocator_t host_allocator,
+ 
+   // Register the statically linked executable library.
+   const iree_hal_executable_library_query_fn_t libraries[] = {
+-      simple_mul_dispatch_0_library_query,
++      //simple_mul_dispatch_0_library_query,
++      module_linked_library_query,
+   };
+   iree_hal_executable_loader_t* library_loader = NULL;
+   iree_status_t status = iree_hal_static_library_loader_create(
+@@ -153,7 +157,8 @@ iree_status_t Run() {
+   }
+ 
+   // Lookup the entry point function call.
+-  const char kMainFunctionName[] = "module.simple_mul";
++  // const char kMainFunctionName[] = "module.simple_mul";
++  const char kMainFunctionName[] = "module.main";
+   iree_runtime_call_t call;
+   memset(&call, 0, sizeof(call));
+   if (iree_status_is_ok(status)) {
+@@ -163,15 +168,26 @@ iree_status_t Run() {
+ 
+   // Populate initial values for 4 * 2 = 8.
+   const int kElementCount = 4;
+-  iree_hal_dim_t shape[1] = {kElementCount};
++  // iree_hal_dim_t shape[1] = {kElementCount};
++  iree_hal_dim_t input_shape[4] = {1, 3, 224, 224};
+   float kFloat4[] = {4.0f, 4.0f, 4.0f, 4.0f};
+   float kFloat2[] = {2.0f, 2.0f, 2.0f, 2.0f};
+ 
++  // input_buffer_descriptor_t inputs[] = {
++  //     {IREE_ARRAYSIZE(shape), shape, IREE_HAL_ELEMENT_TYPE_FLOAT_32, kFloat4,
++  //      sizeof(kFloat4)},
++  //     {IREE_ARRAYSIZE(shape), shape, IREE_HAL_ELEMENT_TYPE_FLOAT_32, kFloat2,
++  //      sizeof(kFloat2)},
++  // };
++
+   input_buffer_descriptor_t inputs[] = {
+-      {IREE_ARRAYSIZE(shape), shape, IREE_HAL_ELEMENT_TYPE_FLOAT_32, kFloat4,
+-       sizeof(kFloat4)},
+-      {IREE_ARRAYSIZE(shape), shape, IREE_HAL_ELEMENT_TYPE_FLOAT_32, kFloat2,
+-       sizeof(kFloat2)},
++      {
++          IREE_ARRAYSIZE(input_shape),
++          input_shape,
++          IREE_HAL_ELEMENT_TYPE_FLOAT_32,
++          model_input,
++          sizeof(model_input),
++      },
+   };
+ 
+   for (size_t i = 0; i < IREE_ARRAYSIZE(inputs); ++i) {
+@@ -192,12 +208,20 @@ iree_status_t Run() {
+   }
+ 
+   // Read back the results and ensure we got the right values.
+-  float results[] = {0.0f, 0.0f, 0.0f, 0.0f};
++  // float results[] = {0.0f, 0.0f, 0.0f, 0.0f};
+   if (iree_status_is_ok(status)) {
++    // status = iree_hal_device_transfer_d2h(
++    //     device, iree_hal_buffer_view_buffer(ret_buffer_view), 0, results,
++    //     sizeof(results), IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
++    //     iree_infinite_timeout());
+     status = iree_hal_device_transfer_d2h(
+-        device, iree_hal_buffer_view_buffer(ret_buffer_view), 0, results,
+-        sizeof(results), IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
+-        iree_infinite_timeout());
++    device,
++    iree_hal_buffer_view_buffer(ret_buffer_view),
++    0,
++    model_output,
++    sizeof(model_output),
++    IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
++    iree_infinite_timeout());
+   }
+   if (iree_status_is_ok(status)) {
+     for (iree_host_size_t i = 0; i < IREE_ARRAYSIZE(results); ++i) {

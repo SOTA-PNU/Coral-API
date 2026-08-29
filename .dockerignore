@@ -1,0 +1,9 @@
+# 빌드 컨텍스트에서 제외 — 생성물·데이터셋이 들어가면 컨텍스트가 수백 MB 된다.
+.git
+lowering/build
+lowering/data
+lowering/*.log
+lowering/**/__pycache__
+ci-docker/artifacts
+ci-docker/patches/*.orig
+**/*.pyc

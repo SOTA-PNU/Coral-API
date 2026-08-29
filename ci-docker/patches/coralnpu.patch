@@ -1,0 +1,57 @@
+diff --git a/.bazelrc b/.bazelrc
+index 73750e7d..27d9bd03 100644
+--- a/.bazelrc
++++ b/.bazelrc
+@@ -130,3 +130,11 @@ build --output_filter="^//(?!(third_party)(/|:|$))"
+ 
+ # Import user config, if it exists (gitignored).
+ try-import %workspace%/.bazelrc.user
++
++# --- npusim: MPACT-CoralNPU behavioral simulator (Coral docs //sim:coralnpu_v2_sim) ---
++# The CLI binary lives in the external @coralnpu_mpact repo and is built from this
++# (coralnpu_hw) workspace. MPACT sources need clang (they use -ffp-model=strict) and
++# the generated decoders #include "external/..." paths, so add the execroot root (-I.).
++#   Usage: bazel run --config=npusim //sim:coralnpu_v2_sim -- <program.elf>
++build:npusim --platforms=//toolchain/host_clang:host_clang_platform
++build:npusim --copt=-I.
+diff --git a/sw/coralnpu_sim/BUILD b/sw/coralnpu_sim/BUILD
+index 2e34ef85..b8ed4613 100644
+--- a/sw/coralnpu_sim/BUILD
++++ b/sw/coralnpu_sim/BUILD
+@@ -65,3 +65,36 @@ py_test(
+         requirement("numpy"),
+     ],
+ )
++py_binary(
++    name = "run_hello",
++    srcs = ["run_hello.py"],
++    deps = [
++        ":coralnpu_v2_sim_utils_lib",
++        requirement("numpy"),
++    ],
++)
++
++py_binary(
++    name = "run_any",
++    srcs = ["run_any.py"],
++    deps = [
++        ":coralnpu_v2_sim_utils_lib",
++        requirement("numpy"),
++    ],
++)
++py_binary(
++    name = "run_probe",
++    srcs = ["run_probe.py"],
++    deps = [
++        ":coralnpu_v2_sim_utils_lib",
++        requirement("numpy"),
++    ],
++)
++py_binary(
++    name = "run_matmul",
++    srcs = ["run_matmul.py"],
++    deps = [
++        ":coralnpu_v2_sim_utils_lib",
++        requirement("numpy"),
++    ],
++)
