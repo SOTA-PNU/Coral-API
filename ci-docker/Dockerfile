@@ -60,10 +60,11 @@ ENV PATH=$VENV/bin:$PATH VIRTUAL_ENV=$VENV
 # 이게 없으면 lenet5 는 'failed to legalize torch.aten.relu' 로 죽고
 # 풀링이 f32 로 남아 완전 정수화가 깨진다.
 COPY patches/torch-mlir.patch /tmp/torch-mlir.patch
-RUN git clone https://github.com/llvm/torch-mlir $WS/torch-mlir \
+RUN git clone --filter=blob:none https://github.com/llvm/torch-mlir $WS/torch-mlir \
  && cd $WS/torch-mlir \
  && git checkout ${TORCH_MLIR_COMMIT} \
- && git submodule update --init --depth 1 externals/llvm-project externals/stablehlo \
+ && git -c submodule.fetchJobs=4 submodule update --init --filter=blob:none \
+      externals/llvm-project externals/stablehlo \
  && git apply --verbose /tmp/torch-mlir.patch
 
 RUN --mount=type=cache,target=/ccache \
@@ -84,7 +85,7 @@ RUN --mount=type=cache,target=/ccache \
       -DTORCH_MLIR_ENABLE_ONNX_C_IMPORTER=OFF \
       -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
       -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
- && cmake --build build --target tools/torch-mlir/all torch-mlir-opt -j"$(nproc)" \
+ && cmake --build build --target TorchMLIRPythonModules torch-mlir-opt -j"$(nproc)" \
  && ccache -s | tail -3
 
 # 파이프라인은 pip 휠이 아니라 이 소스 빌드를 PYTHONPATH 로 쓴다.
@@ -93,10 +94,10 @@ ENV PYTHONPATH=$WS/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir:
 
 # ---------------------------------------------------------------- 5. IREE
 COPY patches/iree.patch /tmp/iree.patch
-RUN git clone https://github.com/iree-org/iree.git $WS/iree \
+RUN git clone --filter=blob:none https://github.com/iree-org/iree.git $WS/iree \
  && cd $WS/iree \
  && git checkout ${IREE_COMMIT} \
- && git submodule update --init --recursive --depth 1 \
+ && git -c submodule.fetchJobs=4 submodule update --init --recursive --filter=blob:none \
  && git apply --verbose /tmp/iree.patch
 
 RUN --mount=type=cache,target=/ccache \
@@ -119,7 +120,7 @@ RUN --mount=type=cache,target=/ccache \
 # //sim:coralnpu_v2_sim 별칭을 파일로 심는다.
 COPY patches/coralnpu.patch /tmp/coralnpu.patch
 COPY files/coralnpu/ /tmp/coralnpu-files/
-RUN git clone https://github.com/google-coral/coralnpu.git $WS/coralnpu \
+RUN git clone --filter=blob:none https://github.com/google-coral/coralnpu.git $WS/coralnpu \
  && cd $WS/coralnpu \
  && git checkout ${CORALNPU_COMMIT} \
  && git apply --verbose /tmp/coralnpu.patch \
