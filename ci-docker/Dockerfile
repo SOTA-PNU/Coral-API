@@ -66,8 +66,10 @@ COPY ci-docker/patches/torch-mlir.patch /tmp/torch-mlir.patch
 RUN git clone --filter=blob:none https://github.com/llvm/torch-mlir $WS/torch-mlir \
  && cd $WS/torch-mlir \
  && git checkout ${TORCH_MLIR_COMMIT} \
- && git -c submodule.fetchJobs=4 submodule update --init --filter=blob:none \
-      externals/llvm-project externals/stablehlo \
+ && (git submodule update --init --depth 1 --jobs 4 \
+        externals/llvm-project externals/stablehlo \
+      || git submodule update --init --jobs 4 \
+        externals/llvm-project externals/stablehlo) \
  && git apply --verbose /tmp/torch-mlir.patch
 
 RUN --mount=type=cache,target=/ccache \
@@ -100,7 +102,8 @@ COPY ci-docker/patches/iree.patch /tmp/iree.patch
 RUN git clone --filter=blob:none https://github.com/iree-org/iree.git $WS/iree \
  && cd $WS/iree \
  && git checkout ${IREE_COMMIT} \
- && git -c submodule.fetchJobs=4 submodule update --init --recursive --filter=blob:none \
+ && (git submodule update --init --recursive --depth 1 --jobs 4 \
+      || git submodule update --init --recursive --jobs 4) \
  && git apply --verbose /tmp/iree.patch
 
 RUN --mount=type=cache,target=/ccache \
