@@ -49,12 +49,17 @@ RUN curl -fsSL -o /usr/local/bin/bazel \
 # ---------------------------------------------------------------- 3. 파이썬
 # cmake/ninja 는 pip 판을 쓴다 (검증된 환경과 동일).
 # torch 는 CPU 휠 — 파이프라인은 CPU 경로만 쓰고 이미지가 2.5GB 작아진다.
+# executorch 는 --no-deps: 1.3.1 이 torch>=2.12/numpy>=2 를 선언해 핀과 해석
+# 불가지만, 파이프라인이 쓰는 XNNPACKQuantizer(torchao 계열 spec)는 이 조합에서
+# 동작함이 검증돼 있다. 이게 빠지면 torch.ao 폴백 양자화기로 떨어져
+# torchao prepare_pt2e 와 spec 클래스가 어긋나 AssertionError 가 난다.
 COPY ci-docker/requirements.txt /tmp/requirements.txt
 RUN python3.10 -m venv $VENV \
  && $VENV/bin/pip install --no-cache-dir --upgrade pip wheel \
  && $VENV/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
       torch==2.8.0 torchvision==0.23.0 \
- && $VENV/bin/pip install --no-cache-dir -r /tmp/requirements.txt
+ && $VENV/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
+ && $VENV/bin/pip install --no-cache-dir --no-deps executorch==1.3.1
 ENV PATH=$VENV/bin:$PATH VIRTUAL_ENV=$VENV
 
 # ---------------------------------------------------------------- 4. torch-mlir

@@ -1,5 +1,5 @@
 diff --git a/.bazelrc b/.bazelrc
-index 73750e7d..27d9bd03 100644
+index 73750e7..27d9bd0 100644
 --- a/.bazelrc
 +++ b/.bazelrc
 @@ -130,3 +130,11 @@ build --output_filter="^//(?!(third_party)(/|:|$))"
@@ -14,8 +14,22 @@ index 73750e7d..27d9bd03 100644
 +#   Usage: bazel run --config=npusim //sim:coralnpu_v2_sim -- <program.elf>
 +build:npusim --platforms=//toolchain/host_clang:host_clang_platform
 +build:npusim --copt=-I.
+diff --git a/WORKSPACE b/WORKSPACE
+index 92932b1..b5a1963 100644
+--- a/WORKSPACE
++++ b/WORKSPACE
+@@ -81,6 +81,9 @@ load("@rules_python//python:repositories.bzl", "python_register_toolchains")
+ python_register_toolchains(
+     name = "python311",
+     python_version = "3.11.6",
++    # 이미지는 root 로 굽고 root 로 돈다. rules_python 은 hermetic 인터프리터를
++    # root 로 받는 것을 기본 거부한다(fail). 컨테이너에서는 이게 정상이므로 허용한다.
++    ignore_root_user_error = True,
+ )
+ coralnpu_repos2()
+ 
 diff --git a/sw/coralnpu_sim/BUILD b/sw/coralnpu_sim/BUILD
-index 2e34ef85..b8ed4613 100644
+index 2e34ef8..b8ed461 100644
 --- a/sw/coralnpu_sim/BUILD
 +++ b/sw/coralnpu_sim/BUILD
 @@ -65,3 +65,36 @@ py_test(
