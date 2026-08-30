@@ -139,11 +139,18 @@ RUN git clone --filter=blob:none https://github.com/google-coral/coralnpu.git $W
 # 시뮬레이터와 RISC-V CRT 를 미리 굽는다. 이 output_base 가 이미지에 남아야
 # 런타임의 bazel run 이 재빌드 없이 즉시 실행된다 (build_coral.sh 는
 # `bazel info output_base` 로 경로를 알아내므로 하드코딩이 없다).
+# 두 타깃은 플랫폼이 다르므로 한 명령에 묶으면 안 된다 (실측 검증):
+#   run_probe = 호스트 플랫폼(--config=npusim), crt = RISC-V(--config=coralnpu_v2).
+# crt 산출 경로는 두 구성 모두 bazel-out/k8-fastbuild/... 로 동일함을 cquery 로 확인.
 RUN --mount=type=cache,target=/bazel-repo-cache \
     --mount=type=cache,target=/bazel-disk-cache \
-    cd $WS/coralnpu && bazel build --config=npusim \
+    cd $WS/coralnpu \
+ && bazel build --config=npusim \
       --repository_cache=/bazel-repo-cache --disk_cache=/bazel-disk-cache \
-      //sw/coralnpu_sim:run_probe //toolchain/crt:crt \
+      //sw/coralnpu_sim:run_probe \
+ && bazel build --config=coralnpu_v2 \
+      --repository_cache=/bazel-repo-cache --disk_cache=/bazel-disk-cache \
+      //toolchain/crt:crt \
  && bazel shutdown
 
 # ---------------------------------------------------------------- 7. 파이프라인
