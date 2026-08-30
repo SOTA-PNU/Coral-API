@@ -5,6 +5,9 @@
 # torch-mlir(+LLVM/MLIR), IREE, CoralNPU 시뮬레이터를 소스에서 전부 빌드하고
 # 파이프라인 코드를 심어 자립 실행 가능한 이미지를 만든다.
 #
+# 빌드 컨텍스트는 **저장소 루트**다 (lowering/ 을 담아야 하므로).
+# 따라서 이 파일의 COPY 경로는 전부 저장소 루트 기준으로 쓴다 — ci-docker/... 접두사 필수.
+#
 # 빌드 시간: 첫 빌드 3~6시간 (LLVM 2회 + bazel). 이후는 BuildKit 캐시 마운트
 # (ccache / bazel repo·disk 캐시)로 크게 단축된다. 캐시는 `docker rmi` 로
 # 이미지를 지워도 남으므로 "매번 이미지 삭제" 정책과 양립한다.
@@ -46,7 +49,7 @@ RUN curl -fsSL -o /usr/local/bin/bazel \
 # ---------------------------------------------------------------- 3. 파이썬
 # cmake/ninja 는 pip 판을 쓴다 (검증된 환경과 동일).
 # torch 는 CPU 휠 — 파이프라인은 CPU 경로만 쓰고 이미지가 2.5GB 작아진다.
-COPY requirements.txt /tmp/requirements.txt
+COPY ci-docker/requirements.txt /tmp/requirements.txt
 RUN python3.10 -m venv $VENV \
  && $VENV/bin/pip install --no-cache-dir --upgrade pip wheel \
  && $VENV/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
@@ -59,7 +62,7 @@ ENV PATH=$VENV/bin:$PATH VIRTUAL_ENV=$VENV
 # (MatchQuantizedOps +366, TorchToTosa +544, FuseQuantizedOps +31).
 # 이게 없으면 lenet5 는 'failed to legalize torch.aten.relu' 로 죽고
 # 풀링이 f32 로 남아 완전 정수화가 깨진다.
-COPY patches/torch-mlir.patch /tmp/torch-mlir.patch
+COPY ci-docker/patches/torch-mlir.patch /tmp/torch-mlir.patch
 RUN git clone --filter=blob:none https://github.com/llvm/torch-mlir $WS/torch-mlir \
  && cd $WS/torch-mlir \
  && git checkout ${TORCH_MLIR_COMMIT} \
@@ -93,7 +96,7 @@ RUN --mount=type=cache,target=/ccache \
 ENV PYTHONPATH=$WS/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir:$WS/torch-mlir/projects/pt1/python
 
 # ---------------------------------------------------------------- 5. IREE
-COPY patches/iree.patch /tmp/iree.patch
+COPY ci-docker/patches/iree.patch /tmp/iree.patch
 RUN git clone --filter=blob:none https://github.com/iree-org/iree.git $WS/iree \
  && cd $WS/iree \
  && git checkout ${IREE_COMMIT} \
@@ -118,8 +121,8 @@ RUN --mount=type=cache,target=/ccache \
 # 로컬 패치: .bazelrc 의 npusim 설정(clang 플랫폼 + execroot -I.), sw BUILD 의
 # py_binary 규칙. 그리고 저장소에 없는 실행 스크립트(run_probe.py 등)와
 # //sim:coralnpu_v2_sim 별칭을 파일로 심는다.
-COPY patches/coralnpu.patch /tmp/coralnpu.patch
-COPY files/coralnpu/ /tmp/coralnpu-files/
+COPY ci-docker/patches/coralnpu.patch /tmp/coralnpu.patch
+COPY ci-docker/files/coralnpu/ /tmp/coralnpu-files/
 RUN git clone --filter=blob:none https://github.com/google-coral/coralnpu.git $WS/coralnpu \
  && cd $WS/coralnpu \
  && git checkout ${CORALNPU_COMMIT} \
