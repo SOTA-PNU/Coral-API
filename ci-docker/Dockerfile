@@ -112,7 +112,10 @@ RUN --mount=type=cache,target=/ccache \
       -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
       -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
       -DIREE_BUILD_COMPILER=ON \
-      -DIREE_BUILD_SAMPLES=ON \
+      # 샘플은 끈다. iree.patch 가 static_library 샘플에 MODEL_DIR(모델 오브젝트)을
+      # 요구하게 바꿔놔서 모델이 없는 이 시점엔 configure 가 죽는다. 파이프라인은
+      # 샘플 실행파일이 아니라 런타임 라이브러리(static_library_loader)만 쓴다.
+      -DIREE_BUILD_SAMPLES=OFF \
       -DIREE_BUILD_TESTS=OFF \
       -DIREE_BUILD_PYTHON_BINDINGS=OFF \
       -DIREE_ENABLE_ASSERTIONS=OFF \
